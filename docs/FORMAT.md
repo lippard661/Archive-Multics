@@ -137,3 +137,22 @@ module mirrors this.
 ## Access (`archive_component_info.access`)
 
 `bit (36)`; bit 1 = r, bit 2 = e, bit 3 = w. Others zero.
+
+## Archives from the MIT Multics source site
+
+Downloads of `*.archive` segments from the MIT Multics source web site
+are valid text-mode archives followed by Bull's copyright notice, added
+as a pseudo-component that is not a valid component: the header has DOS
+line endings (a carriage return before each line feed) and no
+`archive_data_$ident` or `$fence`, the name is
+`bull_copyright_notice.txt`, the bit count is zero-filled (`00020025`),
+and the text has CRLF line endings. Multics itself would report a format
+error after the last real component. `Archive::Multics` recognizes the
+notice, ignores it with a warning, and does not write it back.
+
+## Damaged transfers
+
+Transfers that drop NUL bytes remove the padding after components whose
+length is not a multiple of four characters, so later headers are no
+longer where the bit counts say. With `salvage => 1` (`archive -S`),
+such components are recognized and the padding restored.

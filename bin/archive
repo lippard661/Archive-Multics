@@ -17,7 +17,7 @@ use Fcntl qw(:flock :mode);
 use File::Basename qw(fileparse);
 use Getopt::Long qw(:config bundling require_order no_ignore_case);
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 my $ME = 'archive';
 
 # ---------------------------------------------------------------------------
@@ -69,6 +69,7 @@ for (@KEY_TABLE) {
 my %opt;
 GetOptions(
     'z|zone=s'          => \$opt{zone},
+    'S|salvage'         => \$opt{salvage},
     'P|century-pivot=s' => \$opt{pivot},
     'h|help'            => \$opt{help},
     'V|version'         => \$opt{version},
@@ -89,6 +90,7 @@ Options:
   -z, --zone TZ           time zone for archive dates (default: local)
   -P, --century-pivot N   2-digit years >= N are 19yy (default 50, RFC 5322;
                           30 is Multics MR12.8; "window" for a rolling window)
+  -S, --salvage           read damaged archives as far as possible, with warnings
   -h, --help              this message
   -V, --version           version
 EOT
@@ -208,6 +210,7 @@ sub new_archive_object {
     }
     return Archive::Multics->new(
         validate => 'basic',    # the command reads as leniently as archive_util_
+        salvage  => $opt{salvage},
         (defined $opt{zone}  ? (tz            => $opt{zone})  : ()),
         (defined $opt{pivot} ? (century_pivot => $opt{pivot}) : ()),
     );
@@ -340,9 +343,13 @@ sub process {
         }
         unless ($ar->read($path)) {
             if ($ar->error_code eq 'io') { com_err(\'', $ar->error) }
-            else { com_err(0, "Format error in $disp (" . $ar->error . ')') }
+            else {
+                com_err(0, "Format error in $disp (" . $ar->error . ')'
+                    . ($opt{salvage} ? '' : '; --salvage may recover it'));
+            }
             return;
         }
+        print STDERR "$ME: Warning: $disp: $_.\n" for $ar->warnings;
     }
     elsif (!$k->{norig}) {
         com_err(ENOENT, $disp);
@@ -721,7 +728,7 @@ archive - Multics archive command
 
 =head1 SYNOPSIS
 
-B<archive> [B<-z> I<zone>] [B<-P> I<pivot>] I<key> I<archive_path> [I<paths> ...]
+B<archive> [B<-S>] [B<-z> I<zone>] [B<-P> I<pivot>] I<key> I<archive_path> [I<paths> ...]
 
 B<archive> B<-h> | B<-V>
 
@@ -860,6 +867,13 @@ when a component name looks like an existing archive file.
 
 =over 8
 
+=item B<-S>, B<--salvage>
+
+Read a damaged archive as far as possible, with a warning for each
+repair: components without word padding (NUL bytes lost in transfer),
+junk before or between components, a truncated last component, and
+trailing data. An update then writes a clean archive.
+
 =item B<-z> I<zone>, B<--zone> I<zone>
 
 Time zone for archive dates, which carry none. Default: the local zone.
@@ -920,6 +934,18 @@ Updates lock the archive (L<flock(2)>) so concurrent runs cannot
 interleave.
 
 =back
+
+=head1 ARCHIVES FROM THE MIT SOURCE SITE
+
+Archives downloaded from the MIT Multics source web site end with Bull's
+copyright notice, added as a malformed extra component
+(F<bull_copyright_notice.txt>). B<archive> recognizes it, ignores it with
+a warning, and leaves it out of any archive it writes.
+
+=head1 NOTES
+
+There is no B<ac> short name: on OpenBSD and other BSD systems B<ac> is
+the login accounting command, L<ac(8)>.
 
 =head1 SECURITY
 

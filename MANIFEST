@@ -10,6 +10,7 @@ README.md
 t/01-read.t
 t/02-errors.t
 t/03-write.t
+t/04-salvage.t
 t/10-command.t
 t/11-sandbox.t
 t/data/README

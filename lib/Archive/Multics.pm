@@ -3,7 +3,7 @@ package Archive::Multics;
 use strict;
 use warnings;
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 use Carp qw(croak);
 use Fcntl qw(:mode);
@@ -51,6 +51,7 @@ sub new {
         pivot      => $opt{century_pivot} // 50, # RFC 5322; or 'window' (see _year)
         now        => $opt{now},                 # for tests: "current" Unix time
         validate   => $opt{validate} // 'full',  # 'full' or 'basic'
+        salvage    => $opt{salvage},            # skip damage instead of failing
         error      => '',
         error_code => '',
     }, $class;
@@ -125,76 +126,173 @@ sub write {
 
 # ---------------------------------------------------------------------------
 # Parsing, following archive_.pl1 (CHECK_ARCHIVE, NEXT_HEADER_PTR,
-# GET_COMPONENT_INFO, GET_ALL_COMPONENT_INFO).
+# GET_COMPONENT_INFO, GET_ALL_COMPONENT_INFO), plus two relaxations:
+#
+# - The MIT Multics source site appends Bull's copyright notice to its
+#   downloads as a mangled pseudo-component ("bull_copyright_notice.txt",
+#   with DOS line endings). It is recognized wherever a header is expected
+#   and ignored, with a warning.
+# - With salvage => 1, damage is skipped rather than fatal: components
+#   without word padding (e.g. NULs lost in transfer), junk between
+#   components, a truncated last component, and trailing data.
+
+sub _mit_notice_at {
+    my ($buf, $pos) = @_;
+    return substr($buf, $pos, 200)
+        =~ /\A[\r\n]*\f[\r\n\t\x0F]*[ \t]*bull_copyright_notice\.txt[ \t]/;
+}
+
+# Check the header at $pos. Returns a hash of its fields, or an error string.
+sub _header_at {
+    my ($self, $buf, $pos) = @_;
+    return 'Fewer than 25 words remain for a header.' if length($buf) - $pos < HEADER_SIZE;
+    my %h;
+    @h{qw(begin pad1 name timeup mode time pad bcf end)} =
+        unpack 'a8 a4 a32 a16 a4 a16 a4 a8 a8', substr($buf, $pos, HEADER_SIZE);
+    return 'Header does not begin with archive_data_$ident.' if $h{begin} ne IDENT;
+    return 'Header does not end with archive_data_$fence.'   if $h{end} ne FENCE;
+    (my $bct = $h{bcf}) =~ s/^ +| +$//g;
+    return qq{Bit count field "$h{bcf}" is not a number.} unless $bct =~ /^[0-9]+$/;
+    return 'Date field contains invalid characters.'
+        if $h{timeup} =~ m{[^0-9 ./]} || $h{time} =~ m{[^0-9 ./]};
+    return 'Mode field contains invalid characters.' if $h{mode} =~ /[^rewa ]/;
+    ($h{cname} = $h{name}) =~ s/ +$//;
+    $h{bc} = $bct + 0;
+    if ($self->{validate} eq 'full') {
+        return qq{($h{cname}) Mode field "$h{mode}" is malformed.}
+            unless $h{mode} =~ /^[r ][e ][w ][a ]$/;
+        for ([modified => $h{time}], [updated => $h{timeup}]) {
+            return qq{($h{cname}) Date $_->[0] "$_->[1]" is invalid.}
+                unless defined $self->_parse_date($_->[1]);
+        }
+    }
+    return \%h;
+}
+
+sub _warn { my $self = shift; push @{ $self->{warnings} }, join '', @_ }
 
 sub _parse {
     my ($self, $buf) = @_;
-    my $len = length $buf;
+    my $len     = length $buf;
+    my $salvage = $self->{salvage};
+    $self->{warnings} = [];
+    $self->{trailer}  = '';
 
-    return $self->_fail(not_archive => 'Length is not a whole number of words.') if $len % 4;
+    # Where the MIT notice starts, if there is one.
+    my $mit;
+    my $t = rindex $buf, 'bull_copyright_notice.txt';
+    if ($t >= 0) {
+        my $f = rindex $buf, "\f", $t;
+        $mit = $f if $f >= 0 && $t - $f < 40;
+    }
+    my $mit_here = sub {
+        my ($pos) = @_;
+        return defined $mit && $pos <= $mit
+            && substr($buf, $pos, $mit - $pos) =~ /\A[\r\n]*\z/ && _mit_notice_at($buf, $pos);
+    };
+    my $stop_mit = sub {
+        my ($pos) = @_;
+        $self->{trailer} = substr $buf, $pos;
+        $self->_warn('ignored ', length($self->{trailer}), ' bytes after the last component',
+            ' (the copyright notice appended by the MIT Multics source site)');
+    };
+
     return [] if $len == 0;
-    return $self->_fail(not_archive => 'Shorter than one header.') if $len < HEADER_SIZE;
-    return $self->_fail(not_archive => 'First header does not begin with archive_data_$ident.')
-        if substr($buf, 0, 8) ne IDENT;
-    return $self->_fail(not_archive => 'First header does not end with archive_data_$fence.')
-        if substr($buf, 92, 8) ne FENCE;
-
-    my @comps;
     my $pos = 0;
+    unless ($salvage) {
+        return $self->_fail(not_archive => 'Length is not a whole number of words.')
+            if $len % 4 && !defined $mit;
+        return $self->_fail(not_archive => 'Shorter than one header.') if $len < HEADER_SIZE;
+        return $self->_fail(not_archive => 'First header does not begin with archive_data_$ident.')
+            if substr($buf, 0, 8) ne IDENT;
+        return $self->_fail(not_archive => 'First header does not end with archive_data_$fence.')
+            if substr($buf, 92, 8) ne FENCE;
+    }
+    else {
+        $pos = index $buf, IDENT;
+        if ($pos < 0) {
+            return $self->_fail(not_archive => 'No component header found.');
+        }
+        $self->_warn("skipped $pos bytes before the first component header") if $pos;
+    }
+
+    my (@comps, $unpadded);
     while ($pos < $len) {
+        if ($mit_here->($pos)) { $stop_mit->($pos); last }
         my $n = @comps + 1;
-        my $where = "Component $n at word " . ($pos / 4) . '.';
-        return $self->_fail(archive_fmt_err => "$where Fewer than 25 words remain for a header.")
-            if $len - $pos < HEADER_SIZE;
+        my $where = "Component $n at word " . int($pos / 4) . '.';
+        my $h = $self->_header_at($buf, $pos);
 
-        my $h = substr($buf, $pos, HEADER_SIZE);
-        my ($begin, $pad1, $name, $timeup, $mode, $time, $pad, $bcf, $end) =
-            unpack 'a8 a4 a32 a16 a4 a16 a4 a8 a8', $h;
-
-        return $self->_fail(archive_fmt_err => "$where Header does not begin with archive_data_\$ident.")
-            if $begin ne IDENT;
-        return $self->_fail(archive_fmt_err => "$where Header does not end with archive_data_\$fence.")
-            if $end ne FENCE;
-
-        (my $bct = $bcf) =~ s/^ +| +$//g;
-        return $self->_fail(archive_fmt_err => "$where Bit count field \"$bcf\" is not a number.")
-            unless $bct =~ /^[0-9]+$/;
-        return $self->_fail(archive_fmt_err => "$where Date field contains invalid characters.")
-            if $timeup =~ m{[^0-9 ./]} || $time =~ m{[^0-9 ./]};
-
-        my $bc    = $bct + 0;
-        my $words = int(($bc + 35) / 36);
-        my $size  = HEADER_SIZE + 4 * $words;
-        return $self->_fail(archive_fmt_err => "$where Component extends past the end of the archive.")
-            if $pos + $size > $len;
-        return $self->_fail(archive_fmt_err => "$where Mode field contains invalid characters.")
-            if $mode =~ /[^rewa ]/;
-
-        (my $cname = $name) =~ s/ +$//;
-        if ($self->{validate} eq 'full') {
-            return $self->_fail(archive_fmt_err => "$where ($cname) Mode field \"$mode\" is malformed.")
-                unless $mode =~ /^[r ][e ][w ][a ]$/;
-            for ([modified => $time], [updated => $timeup]) {
-                my ($what, $s) = @$_;
-                return $self->_fail(archive_fmt_err => "$where ($cname) Date $what \"$s\" is invalid.")
-                    unless defined $self->_parse_date($s);
+        unless (ref $h) {
+            return $self->_fail(archive_fmt_err => "$where $h") unless $salvage;
+            my $next = index $buf, IDENT, $pos + 1;
+            while ($next >= 0 && !ref $self->_header_at($buf, $next)) {
+                $next = index $buf, IDENT, $next + 1;
             }
+            if ($next < 0) {
+                $self->{trailer} = substr $buf, $pos;
+                $self->_warn('ignored ', $len - $pos, " bytes at byte $pos ($h)");
+                last;
+            }
+            $self->_warn('skipped ', $next - $pos, " bytes at byte $pos ($h)");
+            $pos = $next;
+            next;
+        }
+
+        my $bc     = $h->{bc};
+        my $chars  = int($bc / 9);
+        my $size   = HEADER_SIZE + 4 * int(($bc + 35) / 36);
+        my $data_e = $pos + HEADER_SIZE + $chars;            # end of the data
+        my $at_boundary = sub { my $p = shift; $p == $len || substr($buf, $p, 8) eq IDENT || $mit_here->($p) };
+        my $raw;
+
+        my $padded = $pos + $size <= $len
+            && substr($buf, $data_e, $size - HEADER_SIZE - $chars) !~ /[^\0]/;
+
+        if (!$salvage) {
+            return $self->_fail(archive_fmt_err => "$where Component extends past the end of the archive.")
+                if $pos + $size > $len;
+            $raw = substr $buf, $pos, $size;
+        }
+        elsif ($padded && $at_boundary->($pos + $size)) {
+            $raw = substr $buf, $pos, $size;
+        }
+        elsif ($data_e <= $len && $at_boundary->($data_e)) {    # no word padding
+            $raw = substr($buf, $pos, HEADER_SIZE + $chars) . ("\0" x ($size - HEADER_SIZE - $chars));
+            $size = HEADER_SIZE + $chars;
+            $unpadded++;
+        }
+        elsif ($pos + $size <= $len) {                          # padded, junk follows
+            $raw = substr $buf, $pos, $size;
+        }
+        else {
+            $self->_warn("dropped component $n ($h->{cname}): it extends past the end of the archive");
+            $self->{trailer} = substr $buf, $pos;
+            last;
         }
 
         push @comps, Archive::Multics::Component->_new(
             archive   => $self,
-            name      => $cname,
+            name      => $h->{cname},
             bit_count => $bc,
-            mode      => $mode,
-            timeup    => $timeup,
-            time      => $time,
-            data      => substr($buf, $pos + HEADER_SIZE, int($bc / 9)),
-            raw       => substr($buf, $pos, $size),
+            mode      => $h->{mode},
+            timeup    => $h->{timeup},
+            time      => $h->{time},
+            data      => substr($buf, $pos + HEADER_SIZE, $chars),
+            raw       => $raw,
         );
         $pos += $size;
     }
+    $self->_warn("$unpadded components were not padded to a word boundary",
+        ' (NUL bytes lost in transfer?)') if $unpadded;
     return \@comps;
 }
+
+# Warnings from the last read (recognized MIT trailer; salvage repairs).
+sub warnings { @{ $_[0]{warnings} // [] } }
+
+# Bytes after the last component that were ignored, if any.
+sub trailer { $_[0]{trailer} // '' }
 
 # ---------------------------------------------------------------------------
 # Dates. Header dates are the first 16 characters of date_time_ output,
@@ -544,6 +642,14 @@ C<full> (default) applies every check C<archive_$get_component_info>
 applies, including mode positions and date parsing. C<basic> applies
 only the character-set checks C<archive_$get_component> applies.
 
+=item salvage
+
+Read damaged archives as far as possible instead of failing: components
+without word padding (NUL bytes lost in transfer) are repaired, junk
+before or between components is skipped, a truncated last component and
+any trailing data are dropped. Each repair is reported by C<warnings>.
+Writing such an archive produces a clean one.
+
 =item file
 
 Read this archive immediately.
@@ -622,6 +728,16 @@ The name defaults to the file's base name.
 
 Write a component to a file (see L</DESCRIPTION> for permissions and
 times). An existing file is replaced only with C<force>.
+
+=head2 warnings, trailer
+
+C<warnings> lists what the last read ignored or repaired. C<trailer>
+returns the bytes after the last component that were ignored.
+
+Archives downloaded from the MIT Multics source site end with Bull's
+copyright notice, appended as a malformed pseudo-component named
+F<bull_copyright_notice.txt>. It is recognized without C<salvage>,
+ignored with a warning, and not written back.
 
 =head2 error, error_code
 

@@ -1,5 +1,12 @@
 Revision history for Archive-Multics
 
+0.02  2026-09-23
+      - Recognize and ignore the copyright notice that the MIT Multics source
+        site appends to its archive downloads.
+      - New salvage option (archive -S): read damaged archives, e.g. with
+        padding NULs lost in transfer, junk, truncation or trailing data.
+      - Documented that there is no ac short name (ac(8) on OpenBSD).
+
 0.01  2026-09-23
       - First release: Archive::Multics module and archive(1) command.
       - Reads and writes Multics archives in text mode; unchanged archives

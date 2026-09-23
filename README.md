@@ -13,9 +13,9 @@ prints on Multics.
 
 ## OpenBSD installation
 
-The OpenBSD package is `p5-Archive-Multics-0.01.tgz`:
+The OpenBSD package is `p5-Archive-Multics-0.02.tgz`:
 
-    pkg_add ./p5-Archive-Multics-0.01.tgz
+    pkg_add ./p5-Archive-Multics-0.02.tgz
 
 It installs the module, `/usr/local/bin/archive`, and the manual pages
 archive(1) and Archive::Multics(3p). The package is architecture
@@ -69,6 +69,13 @@ From Perl:
 - Only text-mode archives are supported. Components whose bit count is
   not a multiple of 9 (such as object segments) are preserved but cannot
   be extracted.
+- Archives downloaded from the MIT Multics source site end with Bull's
+  copyright notice, appended as a malformed extra component. It is
+  recognized, ignored with a warning, and left out of anything written.
+- `-S` (`--salvage`) reads damaged archives as far as possible, for
+  example ones whose padding NUL bytes were lost in transfer.
+- There is no `ac` short name, since `ac` is the login accounting
+  command, ac(8), on OpenBSD.
 - On OpenBSD, `archive` runs under pledge(2) and unveil(2).
 
 The archive format is described in `docs/FORMAT.md`.
