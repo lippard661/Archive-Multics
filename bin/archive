@@ -1,0 +1,951 @@
+#!/usr/bin/perl
+#
+# archive -- the Multics archive command, for Unix.
+#
+# Follows archive.pl1 (MR12.8): same keys, same arguments, same messages,
+# same table layout. Deliberate differences are listed in the manual page.
+#
+# Copyright (c) 2026, Jim Lippard. BSD 3-clause license; see LICENSE.
+
+use strict;
+use warnings;
+
+use Archive::Multics;
+use Cwd qw(getcwd abs_path);
+use Errno qw(ENOENT EACCES EISDIR EEXIST ENOTDIR);
+use Fcntl qw(:flock :mode);
+use File::Basename qw(fileparse);
+use Getopt::Long qw(:config bundling require_order no_ignore_case);
+
+our $VERSION = '0.01';
+my $ME = 'archive';
+
+# ---------------------------------------------------------------------------
+# The key table (archive_key_.alm). Action and flags per key.
+
+my %FLAGS = map { $_ => 1 }
+    qw(update append copy del force long zarg star empty norig brief);
+
+my @KEY_TABLE = (
+    [ r    => replace => qw(empty norig zarg) ],
+    [ rd   => replace => qw(del empty norig zarg) ],
+    [ rdf  => replace => qw(del force empty norig zarg) ],
+    [ cr   => replace => qw(copy empty norig zarg) ],
+    [ crd  => replace => qw(copy del empty norig zarg) ],
+    [ crdf => replace => qw(copy del force empty norig zarg) ],
+    [ u    => replace => qw(update zarg) ],
+    [ ud   => replace => qw(update zarg del) ],
+    [ udf  => replace => qw(update zarg del force) ],
+    [ cu   => replace => qw(copy update zarg) ],
+    [ cud  => replace => qw(copy update zarg del) ],
+    [ cudf => replace => qw(copy update zarg del force) ],
+    [ a    => replace => qw(append empty norig) ],
+    [ ad   => replace => qw(append empty norig del) ],
+    [ adf  => replace => qw(append empty norig del force) ],
+    [ ca   => replace => qw(copy append empty norig) ],
+    [ cad  => replace => qw(copy append empty norig del) ],
+    [ cadf => replace => qw(copy append empty norig del force) ],
+    [ d    => delete  => () ],
+    [ cd   => delete  => qw(copy) ],
+    [ x    => extract => qw(zarg star) ],
+    [ xd   => extract => qw(zarg star del) ],
+    [ xdf  => extract => qw(zarg star del force) ],
+    [ xf   => extract => qw(zarg star force) ],
+    [ t    => table   => qw(star zarg) ],
+    [ tl   => table   => qw(long star zarg) ],
+    [ tb   => table   => qw(star zarg brief) ],
+    [ tlb  => table   => qw(long star zarg brief) ],
+);
+my %KEYS;
+for (@KEY_TABLE) {
+    my ($key, $action, @f) = @$_;
+    $FLAGS{$_} or die "bad flag $_" for @f;
+    $KEYS{$key} = { key => $key, action => $action, map { $_ => 1 } @f };
+}
+
+# ---------------------------------------------------------------------------
+# Options
+
+my %opt;
+GetOptions(
+    'z|zone=s'          => \$opt{zone},
+    'P|century-pivot=s' => \$opt{pivot},
+    'h|help'            => \$opt{help},
+    'V|version'         => \$opt{version},
+) or usage_exit(2);
+
+if ($opt{help}) {
+    print <<"EOT";
+Usage: $ME [options] key archive_path {paths}
+
+Keys:  t tl tb tlb          table of contents
+       a ad adf ca cad cadf append
+       r rd rdf cr crd crdf replace
+       u ud udf cu cud cudf update
+       d cd                 delete
+       x xd xdf xf          extract
+
+Options:
+  -z, --zone TZ           time zone for archive dates (default: local)
+  -P, --century-pivot N   2-digit years >= N are 19yy (default 50, RFC 5322;
+                          30 is Multics MR12.8; "window" for a rolling window)
+  -h, --help              this message
+  -V, --version           version
+EOT
+    exit 0;
+}
+if ($opt{version}) { print "$ME $VERSION (Archive::Multics $Archive::Multics::VERSION)\n"; exit 0 }
+
+my $status = 0;
+my $first_line = 1;    # "archive: " prefix on the first appended/updated line only
+
+main();
+exit $status;
+
+# ---------------------------------------------------------------------------
+# Messages
+
+# Multics error_table_ wording for the common Unix errors.
+sub errtext {
+    my ($err) = @_;
+    return '' unless $err;
+    my $n = 0 + $err;
+    return 'Entry not found.'              if $n == ENOENT || $n == ENOTDIR;
+    return 'Incorrect access on entry.'    if $n == EACCES;
+    return 'The entry is a directory.'     if $n == EISDIR;
+    return 'Name duplication.'             if $n == EEXIST;
+    local $! = $n;
+    return ucfirst("$!") . '.';
+}
+
+# com_err_: "archive: <error text> <message>" on standard error.
+sub com_err {
+    my ($err, $fmt, @args) = @_;
+    my $msg = @args ? sprintf($fmt, @args) : $fmt;
+    my $e = ref $err ? $$err : errtext($err);
+    print STDERR "$ME: ", (length $e ? "$e " : ''), "$msg\n";
+    $status = 1;
+}
+
+# Informational lines (ioa_) on standard output.
+sub info { print @_, "\n" }
+
+# "archive: " on the first appended/updated message, 9 spaces after.
+sub prefixed_info {
+    info(($first_line ? "$ME: " : ' ' x 9) . shift);
+    $first_line = 0;
+}
+
+sub usage_exit {
+    print STDERR "$ME: Usage:  $ME key archive_path {component_names}\n";
+    exit(shift // 1);
+}
+
+# command_query_: yes/no question. End of input means no.
+sub query {
+    my ($question) = @_;
+    while (1) {
+        print STDERR "\n$ME: $question  ";
+        my $ans = <STDIN>;
+        unless (defined $ans) { print STDERR "\n"; return 0 }
+        $ans =~ s/^\s+|\s+$//g;
+        return 1 if $ans =~ /^(?:yes|y)$/i;
+        return 0 if $ans =~ /^(?:no|n)$/i;
+        print STDERR "Please answer yes or no.";
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Paths
+
+sub abs_dir {
+    my ($d) = @_;
+    my $a = abs_path($d);
+    return defined $a ? $a : $d;
+}
+
+sub display_path {
+    my ($dir, $name) = @_;
+    my $d = abs_dir($dir);
+    return $d eq '/' ? "/$name" : "$d/$name";
+}
+
+sub split_path {
+    my ($p) = @_;
+    my ($name, $dir) = fileparse($p);
+    $dir =~ s{/+$}{} unless $dir =~ m{^/+$};
+    $dir = '.' if $dir eq '';
+    return ($dir, $name);
+}
+
+sub has_stars { $_[0] =~ /[*?]/ }
+
+# Multics star names: components separated by ".", "*" matches any
+# characters within one component, "?" one character, "**" any number of
+# whole components.
+sub star_regex {
+    my ($star) = @_;
+    my @parts = split /\./, $star, -1;
+    my $re = '';
+    for my $i (0 .. $#parts) {
+        my $p = $parts[$i];
+        my $last = $i == $#parts;
+        if ($p eq '**') {
+            $re .= $last ? '(?:[^.]*(?:\.[^.]*)*)?' : '(?:[^.]*\.)*';
+            next;
+        }
+        (my $r = quotemeta $p) =~ s/\\\*/[^.]*/g;
+        $r =~ s/\\\?/[^.]/g;
+        $re .= $r . ($last ? '' : '\.');
+    }
+    return qr/^$re$/;
+}
+
+sub new_archive_object {
+    if (defined $opt{pivot} && $opt{pivot} !~ /^(?:window|\d+)$/) {
+        print STDERR "$ME: --century-pivot must be a number or \"window\"\n";
+        exit 2;
+    }
+    return Archive::Multics->new(
+        validate => 'basic',    # the command reads as leniently as archive_util_
+        (defined $opt{zone}  ? (tz            => $opt{zone})  : ()),
+        (defined $opt{pivot} ? (century_pivot => $opt{pivot}) : ()),
+    );
+}
+
+# ---------------------------------------------------------------------------
+# Main
+
+sub main {
+    my $keyarg = shift @ARGV // usage_exit();
+    if (length $keyarg > 4 || !$KEYS{$keyarg}) {
+        com_err(0, "Unrecognized key - $keyarg");
+        return;
+    }
+    my $k = $KEYS{$keyarg};
+
+    my $patharg = shift @ARGV;
+    unless (defined $patharg) {
+        my $names = ($k->{append} || $k->{del}) ? 'component_names' : '{component_names}';
+        print STDERR "$ME: Usage:  $ME key archive_path $names\n";
+        $status = 1;
+        return;
+    }
+    my ($dir, $name) = split_path($patharg);
+    $name .= '.archive' unless $name =~ /\.archive$/;
+
+    sandbox($k, $dir, \@ARGV) if $^O eq 'openbsd';
+
+    if (has_stars($name)) {
+        unless ($k->{star}) {
+            com_err(0, "Star convention cannot be used with this key.  $keyarg");
+            return;
+        }
+        my $re = star_regex($name);
+        opendir my $dh, $dir or do { com_err($!, display_path($dir, $name)); return };
+        my @match = sort grep { $_ =~ $re && !-d "$dir/$_" } readdir $dh;
+        closedir $dh;
+        unless (@match) {
+            com_err(\'No match for star name.', display_path($dir, $name));
+            return;
+        }
+        process($k, $dir, $_, @ARGV) for @match;
+        return;
+    }
+    process($k, $dir, $name, @ARGV);
+}
+
+# ---------------------------------------------------------------------------
+# OpenBSD: unveil only the directories this invocation can touch, then
+# pledge only what the key needs. Done once the arguments are known and
+# before any archive or file is opened.
+
+sub sandbox {
+    my ($k, $dir, $args) = @_;
+    require OpenBSD::Pledge;
+    require OpenBSD::Unveil;
+
+    my $act    = $k->{action};
+    my $writes = $act ne 'table' && !($act eq 'extract' && !$k->{del});   # rewrites the archive
+    my $files  = $act eq 'extract';                                   # creates other files
+    my @named  = grep { length } @$args;
+
+    my %perm;
+    my $add = sub {
+        my ($p, $how) = @_;
+        my $a = abs_path($p);
+        $perm{defined $a ? $a : $p} .= $how;
+    };
+
+    # Perl's own library (for anything loaded late) and time zone data.
+    $add->($_, 'r') for grep { !ref && -d } @INC;
+    $add->($_, 'r') for grep { -e } qw(/usr/share/zoneinfo /etc/localtime);
+
+    # The archive's directory: rewritten by rename unless a copy is made.
+    $add->($dir, ($writes && !$k->{copy}) ? 'rwc' : 'r');
+
+    # The working directory: global replace/update reads (and d deletes)
+    # sources there, copies are written there, extraction defaults there.
+    my $cwd_how = 'r';
+    $cwd_how .= 'wc' if $k->{copy} || ($files && !@named)
+        || ($act eq 'replace' && $k->{del} && !@named);
+    $add->(getcwd(), $cwd_how);
+
+    # Source and destination directories named by the paths.
+    if ($act eq 'replace' || $act eq 'extract') {
+        for my $p (@named) {
+            my ($d) = split_path($p);
+            if ($files) { $add->($d, 'rwc'); next }
+            $add->($d, $k->{del} ? 'rc' : 'r');
+            if (-l $p) {    # read through a symbolic link
+                my $t = abs_path($p);
+                $add->((split_path($t))[0], 'r') if defined $t;
+            }
+        }
+    }
+
+    for my $p (sort keys %perm) {
+        my %seen;
+        my $how = join '', grep { !$seen{$_}++ } split //, $perm{$p};
+        OpenBSD::Unveil::unveil($p, $how) or $!{ENOENT}    # missing: reported later as usual
+            or die "$ME: unveil $p: $!\n";
+    }
+    OpenBSD::Unveil::unveil() or die "$ME: unveil: $!\n";
+
+    my @promises = qw(rpath);
+    push @promises, qw(wpath cpath fattr) if $writes || $files;
+    push @promises, qw(flock)             if $writes;
+    OpenBSD::Pledge::pledge(@promises) or die "$ME: pledge: $!\n";
+}
+
+# ---------------------------------------------------------------------------
+# One archive
+
+sub process {
+    my ($k, $dir, $name, @args) = @_;
+    my $path = $dir eq '.' ? $name : "$dir/$name";
+    my $disp = display_path($dir, $name);
+    my $cwd  = getcwd();
+    my $modifies = $k->{action} ne 'table' && !($k->{action} eq 'extract' && !$k->{del});
+
+    my $ar = new_archive_object();
+    my $exists = -e $path || -l $path;
+    my $lock;
+
+    if ($exists) {
+        if (-d $path) { com_err(EISDIR, $disp); return }
+        unless (-r $path) { com_err(EACCES, $disp); return }    # never treated as missing
+        if ($modifies && !$k->{copy}) {
+            $lock = lock_archive($path, $disp) or return;
+        }
+        unless ($ar->read($path)) {
+            if ($ar->error_code eq 'io') { com_err(\'', $ar->error) }
+            else { com_err(0, "Format error in $disp (" . $ar->error . ')') }
+            return;
+        }
+    }
+    elsif (!$k->{norig}) {
+        com_err(ENOENT, $disp);
+        return;
+    }
+
+    if (!$k->{empty} && $exists && !$ar->list_components) {
+        com_err(0, "$disp is empty.");
+        return;
+    }
+
+    my $out_path = $path;
+    if ($k->{copy}) {
+        unless ($exists) {
+            com_err(0, "Attempt to use copy feature when original not found.  $disp");
+            return;
+        }
+        if (abs_dir($dir) eq abs_dir($cwd)) {
+            com_err(0, "Attempt to copy onto original.  $disp");
+            return;
+        }
+        $out_path = "$cwd/$name";
+    }
+
+    # Component arguments.
+    my @req;    # { name, dir, path, flag, code }
+    my %seen;
+    my $by_name = $k->{action} eq 'table' || $k->{action} eq 'delete';
+    my $warned;
+    for my $a (@args) {
+        next if $a eq '';
+        my ($cdir, $cname) = $by_name ? (undef, $a) : split_path($a);
+        if (length $cname > 32) {
+            com_err(\'Entry name too long.', $a);
+            next;
+        }
+        if (!$warned && ($k->{action} eq 'table' || $k->{action} eq 'extract')
+            && $cname =~ /\.archive$/ && -f $a && !$ar->contains_component($cname)) {
+            print STDERR "$ME: Warning: $a looks like an archive, not a component. "
+                . "Quote star names so that $ME expands them.\n";
+            $warned = 1;
+        }
+        if ($seen{$cname}++) {
+            com_err(0, "Duplicated request for this component. $cname");
+            next;
+        }
+        push @req, { name => $cname, dir => $cdir, path => $a, flag => 0, code => 0 };
+    }
+
+    if (!$k->{zarg} && !@req) {
+        com_err(0, "Some component names must be specified with this key - $k->{key}");
+        return;
+    }
+    return if @args && !@req;    # arguments given, none usable
+
+    my %ctx = (k => $k, ar => $ar, req => \@req, dir => $dir, name => $name,
+               path => $path, disp => $disp, cwd => $cwd, exists => $exists,
+               out_path => $out_path, lock => $lock);
+
+    if    ($k->{action} eq 'table')   { do_table(\%ctx) }
+    elsif ($k->{action} eq 'replace') { do_replace(\%ctx) }
+    elsif ($k->{action} eq 'delete')  { do_delete(\%ctx) }
+    else                              { do_extract(\%ctx) }
+}
+
+# Exclusive lock on the archive for the whole update. The file is replaced
+# by rename, so re-check after locking that the name still refers to the
+# file locked.
+sub lock_archive {
+    my ($path, $disp) = @_;
+    for (1 .. 10) {
+        open my $fh, '<', $path or do { com_err($!, $disp); return };
+        flock $fh, LOCK_EX or do { com_err($!, $disp); return };
+        my @a = stat $fh;
+        my @b = stat $path;
+        return $fh if @b && $a[0] == $b[0] && $a[1] == $b[1];
+        close $fh;
+    }
+    com_err(0, "Could not lock $disp");
+    return;
+}
+
+# ---------------------------------------------------------------------------
+# Writing the result
+
+# Write the archive (in place, or a copy in the working directory).
+# Returns true if written.
+sub write_archive {
+    my ($c) = @_;
+    my ($ar, $k) = @$c{qw(ar k)};
+
+    if ($k->{copy}) {
+        my $out = $c->{out_path};
+        if (-e $out || -l $out) {
+            my $od = display_path(split_path($out));
+            return 0 unless query("Name duplication. Do you want to delete the old file $od?");
+        }
+        info("$ME: Copying $c->{disp}");
+    }
+    elsif (!$c->{exists}) {
+        info("$ME: Creating $c->{disp}");
+    }
+    elsif (!-w $c->{path}) {
+        return 0 unless query("Do you want to update the protected file $c->{disp} ?");
+    }
+
+    unless ($ar->write($c->{out_path})) {
+        com_err(\'', $ar->error);
+        com_err(0, "Archive $c->{disp} not updated.");
+        return 0;
+    }
+    return 1;
+}
+
+# Delete a source file after it was put in the archive (d keys). A
+# symbolic link is removed itself, not its target.
+sub delete_source {
+    my ($c, $path) = @_;
+    my $disp = display_path(split_path($path));
+    if (!-l $path && !-w $path && !$c->{k}{force}) {
+        return unless query("Do you want to delete the protected file $disp?");
+    }
+    unlink $path or com_err(0, "Could not delete $disp");
+}
+
+# ---------------------------------------------------------------------------
+# t, tl, tb, tlb
+
+# ioa_ tabs, expanded at Multics tab stops (every 10 columns).
+sub expand_tabs {
+    my ($s) = @_;
+    my $out = '';
+    for my $ch (split //, $s) {
+        if ($ch eq "\t") { $out .= ' ' x (10 - length($out) % 10) }
+        else             { $out .= $ch }
+    }
+    return $out;
+}
+
+sub do_table {
+    my ($c) = @_;
+    my ($ar, $k, $req) = @$c{qw(ar k req)};
+    my %want = map { $_->{name} => $_ } @$req;
+    my $header_done = $k->{brief};
+
+    for my $comp ($ar->list_components) {
+        if (@$req) {
+            my $r = $want{$comp->name} or next;
+            $r->{flag} = 1;
+        }
+        unless ($header_done) {
+            print "\n", expand_tabs("\t$c->{disp}"), "\n\n";
+            print $k->{long}
+                ? expand_tabs(" name\t\t\t      updated      mode\tmodified\t   length") . "\n\n"
+                : expand_tabs("  updated\t\t   name") . "\n\n";
+            $header_done = 1;
+        }
+        if ($k->{long}) {
+            printf "%-32s%-17s%-5s%-16s%8d\n", $comp->name, $comp->time_updated_string,
+                $comp->mode_field, $comp->time_modified_string, $comp->bit_count;
+        }
+        else {
+            printf "%-20s%s\n", $comp->time_updated_string, $comp->name;
+        }
+    }
+    print "\n";
+    not_found_messages($c);
+}
+
+sub not_found_messages {
+    my ($c) = @_;
+    for my $r (@{ $c->{req} }) {
+        com_err(0, "$r->{name} not found in $c->{disp}") if $r->{flag} == 0;
+    }
+}
+
+# ---------------------------------------------------------------------------
+# r, a, u and their c/d/f forms
+
+# flags, as in archive.pl1:
+#   0 not found in archive      1 done            2 could not append
+#   3 found in archive but not replaced           4 appended
+#   5 found in archive during append request      6 (overflow; n/a)
+
+sub do_replace {
+    my ($c) = @_;
+    my ($ar, $k, $req) = @$c{qw(ar k req)};
+
+    if (!$c->{exists} && !@$req) {
+        com_err(ENOENT, $c->{disp});
+        return;
+    }
+
+    my $changed = 0;
+    my @delete;            # sources to delete afterwards
+    my @updated_global;    # global update messages, printed after writing
+    my ($found_something, $updated_something) = (0, 0);
+    my $archive_id = $c->{exists} ? join(':', (stat $c->{path})[0, 1]) : '';
+
+    # Try to put one source into the archive. Returns 1 if replaced/added.
+    my $put = sub {
+        my ($src, $cname, $r) = @_;
+        my $sdisp = display_path(split_path($src));
+        my $fail = sub {
+            my ($err) = @_;
+            if ($r) { $r->{code} = $err; $r->{flag} = $k->{append} ? 2 : 3 }
+            else    { com_err($err, $sdisp) }
+            return 0;
+        };
+        my @st = stat $src;
+        return $fail->($!) unless @st;
+        return $fail->(EISDIR) if -d _;
+        return $fail->(EACCES) unless -r _;
+        if ($archive_id && join(':', @st[0, 1]) eq $archive_id) {    # the archive itself
+            $r->{flag} = 3 if $r;
+            return 0;
+        }
+        $found_something = 1;
+        my $mtime = $st[9];
+        if ($k->{update}) {
+            my $old = $ar->get_component($cname);
+            if ($old && !$ar->is_newer($mtime, $old)) {
+                $r->{flag} = 3 if $r;    # code 0: latest copy already in archive
+                return 0;
+            }
+            $updated_something = 1;
+        }
+        open my $fh, '<:raw', $src or return $fail->($!);
+        my $data = do { local $/; <$fh> } // '';
+        close $fh;
+        my %attr = $ar->file_attributes($src);
+        unless ($ar->replace_component($cname, $data, %attr)) { my $e = $ar->error; return $fail->(\$e) }
+        $changed = 1;
+        push @delete, $src if $k->{del};
+        push @updated_global, $cname if $k->{update} && !$r;
+        return 1;
+    };
+
+    my %want = map { $_->{name} => $_ } @$req;
+    for my $comp ($ar->list_components) {
+        my $cname = $comp->name;
+        if (!@$req) {    # global: replace from the working directory
+            my $src = "$c->{cwd}/$cname";
+            next unless -e $src && !-d $src;
+            $put->($src, $cname, undef);
+            next;
+        }
+        my $r = $want{$cname} or next;
+        next if $r->{flag};    # duplicate component name in the archive
+        if ($k->{append}) { $r->{flag} = 5; next }
+        $r->{flag} = 1;
+        $put->($r->{path}, $cname, $r);
+    }
+
+    unless ($k->{update}) {
+        for my $r (@$req) {
+            next unless $r->{flag} == 0;
+            $r->{flag} = 4 if $put->($r->{path}, $r->{name}, $r);
+        }
+    }
+
+    my $wrote = 0;
+    if ($changed || ($k->{copy} && $ar->list_components)) {
+        $wrote = write_archive($c) or return;
+    }
+    my $dest = $k->{copy} ? display_path($c->{cwd}, $c->{name}) : $c->{disp};
+    prefixed_info("$_ updated in $dest") for @updated_global;
+
+    delete_source($c, $_) for $wrote ? @delete : ();
+
+    for my $r (@$req) {
+        my $f = $r->{flag};
+        my $sdisp = display_path($r->{dir}, $r->{name});
+        if    ($f == 0) { com_err(0, "$r->{name} not found in $c->{disp}") }
+        elsif ($f == 2) { com_err($r->{code}, "Could not append $sdisp to $c->{disp}") }
+        elsif ($f == 3) {
+            if ($k->{update} && !$r->{code}) {
+                com_err(0, "Did not update $r->{name} because latest copy already in $c->{disp}")
+                    if $updated_something;
+            }
+            elsif ($found_something || $r->{code}) {
+                com_err($r->{code}, "Could not replace $sdisp in $c->{disp}");
+            }
+        }
+        elsif ($f == 4 && !$k->{append} && $wrote) { prefixed_info("$sdisp appended to $dest") }
+        elsif ($f == 5) { com_err(0, "Did not append $r->{name} because copy found in $c->{disp}") }
+    }
+
+    if ($k->{update}) {
+        my $where = abs_dir($c->{cwd});
+        if (!$found_something) {
+            com_err(0, "No matching segments" . (@$req ? '' : " in $where")
+                . "; no components were updated in archive $c->{disp}");
+        }
+        elsif (!$updated_something) {
+            com_err(0, "Archive $c->{disp} contains the latest versions; no components were updated"
+                . (@$req ? '' : " from $where") . '.');
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# d, cd
+
+sub do_delete {
+    my ($c) = @_;
+    my ($ar, $req) = @$c{qw(ar req)};
+    my $changed = 0;
+    for my $r (@$req) {
+        while ($ar->contains_component($r->{name})) {
+            $ar->delete_component($r->{name});
+            $r->{flag} = 1;
+            $changed = 1;
+        }
+    }
+    if ($changed || $c->{k}{copy}) {
+        write_archive($c) or return;
+        info("$ME: All components of $c->{disp} have been deleted.")
+            unless $ar->list_components;
+    }
+    not_found_messages($c);
+}
+
+# ---------------------------------------------------------------------------
+# x, xd, xdf, xf
+
+sub do_extract {
+    my ($c) = @_;
+    my ($ar, $k, $req) = @$c{qw(ar k req)};
+    my %want = map { $_->{name} => $_ } @$req;
+    my @remove;
+
+    for my $comp ($ar->list_components) {
+        my $cname = $comp->name;
+        my $r;
+        if (@$req) { $r = $want{$cname} or next; $r->{flag} = 1 }
+        my $ddir = $r ? $r->{dir} : '.';
+        my $dest = $ddir eq '.' ? $cname : "$ddir/$cname";
+        my $ddisp = display_path($ddir, $cname);
+
+        unless (-d $ddir) { com_err(ENOENT, display_path(split_path($ddir))); next }
+        unless (-w $ddir) { com_err(\'Append permission missing.', abs_dir($ddir)); next }
+        unless ($comp->is_text) {
+            com_err(0, "$cname has a bit count that is not a multiple of 9; not extracted.");
+            next;
+        }
+        if (-e $dest || -l $dest) {
+            if (-d $dest && !-l $dest) { com_err(EISDIR, $ddisp); next }
+            unless ($k->{force}) {
+                next unless query("Name duplication. Do you want to delete the old file $ddisp?");
+            }
+            # A symbolic link is replaced itself; its target is untouched.
+            unless (unlink $dest) { com_err($!, $ddisp); next }
+        }
+        unless ($ar->extract_component($cname, $dest)) {
+            com_err(\'', $ar->error);
+            next;
+        }
+        push @remove, $comp if $k->{del};
+    }
+
+    if (@remove) {
+        $ar->remove_component($_) for @remove;
+        write_archive($c) or return;
+        info("$ME: All components of $c->{disp} have been deleted.")
+            unless $ar->list_components;
+    }
+    not_found_messages($c);
+}
+
+__END__
+
+=head1 NAME
+
+archive - Multics archive command
+
+=head1 SYNOPSIS
+
+B<archive> [B<-z> I<zone>] [B<-P> I<pivot>] I<key> I<archive_path> [I<paths> ...]
+
+B<archive> B<-h> | B<-V>
+
+=head1 DESCRIPTION
+
+B<archive> combines files into a single Multics archive segment and
+extracts, lists, replaces, updates and deletes its components. It
+behaves like the Multics C<archive> (C<ac>) command of MR12.8: same keys,
+same arguments, same messages and the same table layout. Archives are
+read and written in text mode, one byte per 9-bit Multics character,
+as moved to and from Multics with C<encode_base64> and C<decode_base64>.
+
+The C<.archive> suffix is added to I<archive_path> if it is missing.
+
+=head1 KEYS
+
+=head2 Table of contents
+
+=over 8
+
+=item B<t>
+
+Print the table of contents: all components, or only those named by
+I<paths>. A title and column headings come first.
+
+=item B<tl>
+
+Long form: name, date updated, mode, date modified and bit count.
+
+=item B<tb>, B<tlb>
+
+As B<t> and B<tl> without the title and headings.
+
+=back
+
+=head2 Append
+
+=over 8
+
+=item B<a>
+
+Append the named files. A component already in the archive is not
+replaced, and a message says so. At least one path must be given.
+
+=item B<ad>, B<adf>
+
+Append, then delete the appended files; B<f> deletes without asking
+about protected files.
+
+=item B<ca>, B<cad>, B<cadf>
+
+As above, writing an updated copy of the archive in the working
+directory and leaving the original unchanged.
+
+=back
+
+=head2 Replace
+
+=over 8
+
+=item B<r>
+
+Replace the named components, or add them if not present. With no
+paths, every component for which a file of the same name exists in the
+working directory is replaced.
+
+=item B<rd>, B<rdf>, B<cr>, B<crd>, B<crdf>
+
+Replace and delete, and the copy forms, as for append.
+
+=back
+
+=head2 Update
+
+=over 8
+
+=item B<u>
+
+As B<r>, but replace only components whose file has a later
+modification time than the component's "modified" date, compared to a
+tenth of a minute. Components are not added.
+
+=item B<ud>, B<udf>, B<cu>, B<cud>, B<cudf>
+
+Update and delete, and the copy forms.
+
+=back
+
+=head2 Delete
+
+=over 8
+
+=item B<d>
+
+Delete the named components from the archive.
+
+=item B<cd>
+
+As B<d>, writing an updated copy in the working directory.
+
+=back
+
+=head2 Extract
+
+=over 8
+
+=item B<x>
+
+Extract the named components (or all) to files. The directory part of
+each path says where the file goes; with no paths, files go in the
+working directory. The recorded access sets the permissions (r, e, w as
+read, execute, write, less the umask) and the "modified" date sets the
+modification time.
+
+=item B<xd>
+
+Extract, then delete the extracted components from the archive.
+
+=item B<xf>, B<xdf>
+
+Replace existing files without asking.
+
+=back
+
+=head1 STAR NAMES
+
+For the table and extract keys, I<archive_path> may be a Multics star
+name, quoted so that the shell leaves it alone: C<archive t '*'> lists
+every archive in the working directory, in name order. C<*> matches any
+characters within one period-separated component of a name, C<?> one
+character, and C<**> any number of whole components. An unquoted shell
+glob would pass the extra archives as component names; B<archive> warns
+when a component name looks like an existing archive file.
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-z> I<zone>, B<--zone> I<zone>
+
+Time zone for archive dates, which carry none. Default: the local zone.
+Use the zone of the Multics site that wrote the archive.
+
+=item B<-P> I<n>, B<--century-pivot> I<n>
+
+Two-digit years I<n> and above are 19yy, lower ones 20yy. The default,
+50, is the rule of RFC 5322 and reads every date from 1950 to 2049
+correctly. Multics MR12.8 uses 30, which misreads dates from 2030 on.
+B<window> instead takes the latest year ending in those digits that is
+at most one year from now.
+
+=item B<-h>, B<--help>
+
+=item B<-V>, B<--version>
+
+=back
+
+=head1 DIFFERENCES FROM MULTICS
+
+=over 4
+
+=item *
+
+An archive is updated by writing a new file and renaming it over the
+old one, so a failure never damages the original; its permissions are
+kept, but hard links to it are not updated.
+
+=item *
+
+A protected (read-only) archive is updated after the same query Multics
+asks; it stays read-only.
+
+=item *
+
+Extracted files get the component's modification time.
+
+=item *
+
+B<d> keys remove a symbolic link itself, not its target, and extracting
+onto a symbolic link replaces the link, not the file it points to.
+
+=item *
+
+Component names longer than 32 characters are an error rather than
+being truncated, and an unreadable archive is reported rather than
+treated as missing.
+
+=item *
+
+The table's length column is printed right-justified even if the
+archive has it left-justified.
+
+=item *
+
+Updates lock the archive (L<flock(2)>) so concurrent runs cannot
+interleave.
+
+=back
+
+=head1 SECURITY
+
+On OpenBSD, once its arguments are parsed, B<archive> restricts itself
+with L<unveil(2)> and L<pledge(2)>. It unveils only Perl's library
+directories and the time zone files (read), the archive's directory
+(read, or read/write/create when the archive is updated in place), the
+working directory (read, plus write/create for copies, extraction there
+and global C<rd>/C<ud>), and the directories of the named paths: read
+for sources (plus create for C<d> keys, and the target's directory for a
+source that is a symbolic link), read/write/create for extraction.
+
+Promises: C<stdio rpath> for the table keys; C<wpath cpath fattr> added
+for keys that write files; C<flock> added for keys that rewrite the
+archive.
+
+=head1 EXIT STATUS
+
+0 if no errors were reported, 1 otherwise.
+
+=head1 SEE ALSO
+
+L<Archive::Multics>
+
+=head1 AUTHOR
+
+Jim Lippard
+
+=cut

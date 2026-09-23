@@ -1,0 +1,22 @@
+bin/archive
+Changes
+docs/FORMAT.md
+lib/Archive/Multics.pm
+lib/Archive/Multics/Component.pm
+LICENSE
+Makefile.PL
+MANIFEST			This list of files
+README.md
+t/01-read.t
+t/02-errors.t
+t/03-write.t
+t/10-command.t
+t/11-sandbox.t
+t/data/README
+t/data/tests.ac_t.txt
+t/data/tests.ac_tl.txt
+t/data/tests.archive
+t/lib/OpenBSD/Pledge.pm
+t/lib/OpenBSD/Unveil.pm
+META.yml                                 Module YAML meta-data (added by MakeMaker)
+META.json                                Module JSON meta-data (added by MakeMaker)

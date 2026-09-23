@@ -1,0 +1,20 @@
+
+          >user_dir_dir>Multics>Lippard>actest>tests.archive
+
+ name                               updated      mode       modified     length
+
+arctest.ec                      09/22/26  1639.0 r w  09/22/26  1630.0   37413
+double.ec                       09/22/26  1639.0 r w  09/22/26  1630.0    1935
+archive_test.pl1                09/22/26  1639.0 r w  09/22/26  1630.0   62604
+seed.txt                        09/22/26  1639.0 r w  09/22/26  1630.0    2592
+t_baddate.archive               09/22/26  1639.0 r w  09/22/26  1630.0    2484
+t_badmode.archive               09/22/26  1639.0 r w  09/22/26  1630.0    2484
+t_bigbc.archive                 09/22/26  1639.0 r w  09/22/26  1630.0    2484
+t_leftbc.archive                09/22/26  1639.0 r w  09/22/26  1630.0    2484
+t_longname.archive              09/22/26  1639.0 r w  09/22/26  1630.0    2304
+t_nofence.archive               09/22/26  1639.0 r w  09/22/26  1630.0    2484
+t_obsolete.archive              09/22/26  1639.0 r w  09/22/26  1630.0    2484
+t_ok.archive                    09/22/26  1639.0 r w  09/22/26  1630.0    2484
+t_trailing.archive              09/22/26  1639.0 r w  09/22/26  1630.0    2556
+t_unaligned.archive             09/22/26  1639.0 r w  09/22/26  1630.0    2493
+

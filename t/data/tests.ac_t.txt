@@ -1,0 +1,20 @@
+
+          >user_dir_dir>Multics>Lippard>actest>tests.archive
+
+  updated              name
+
+09/22/26  1639.0    arctest.ec
+09/22/26  1639.0    double.ec
+09/22/26  1639.0    archive_test.pl1
+09/22/26  1639.0    seed.txt
+09/22/26  1639.0    t_baddate.archive
+09/22/26  1639.0    t_badmode.archive
+09/22/26  1639.0    t_bigbc.archive
+09/22/26  1639.0    t_leftbc.archive
+09/22/26  1639.0    t_longname.archive
+09/22/26  1639.0    t_nofence.archive
+09/22/26  1639.0    t_obsolete.archive
+09/22/26  1639.0    t_ok.archive
+09/22/26  1639.0    t_trailing.archive
+09/22/26  1639.0    t_unaligned.archive
+

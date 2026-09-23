@@ -1,0 +1,20 @@
+Test data
+
+tests.archive
+    An archive written from docs/FORMAT.md and checked on Multics MR12.8
+    (2026-09-22): ac t and ac tl listed it without error, and its SHA-256
+    matched after a base64 transfer. Besides some ordinary text
+    components, it holds a set of small archives with deliberately bad
+    headers (t_badmode, t_baddate, t_bigbc, t_trailing, t_unaligned,
+    t_obsolete, t_nofence), one with a left-justified bit count
+    (t_leftbc), one with a 32-character component name (t_longname), and
+    a good one (t_ok). Its other components are the Multics programs that
+    were used to run the same cases on Multics.
+
+tests.ac_t.txt, tests.ac_tl.txt
+    The output of ac t and ac tl for tests.archive on Multics. The tests
+    require archive t and archive tl to print the same thing, apart from
+    the pathname in the title.
+
+The two-digit-year tests in 01-read.t use clock values returned by
+convert_date_to_binary_ on Multics MR12.8.
