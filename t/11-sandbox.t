@@ -4,6 +4,7 @@ use Test::More;
 use FindBin;
 use File::Temp qw(tempdir);
 use Cwd qw(abs_path getcwd);
+use File::Spec;
 
 # Checks what the command would unveil and pledge on OpenBSD, using
 # stand-in OpenBSD::Pledge and OpenBSD::Unveil modules that only record
@@ -18,8 +19,16 @@ sub sandbox_for {
     my $old = getcwd();
     chdir $dir or die;
     local $ENV{SANDBOX_LOG} = $log;
+    # Only the sandbox calls matter here; the command's own messages (e.g.
+    # "Entry not found" for t on an archive not yet created) are discarded.
+    open my $saveout, '>&', \*STDOUT or die;
+    open my $saveerr, '>&', \*STDERR or die;
+    open STDOUT, '>', File::Spec->devnull or die;
+    open STDERR, '>', File::Spec->devnull or die;
     system $^X, "-I$ROOT/t/lib", "-I$ROOT/lib", '-e',
         '$^O = "openbsd"; @ARGV = @ARGV; do $ENV{CMD}; die $@ if $@', @args;
+    open STDOUT, '>&', $saveout or die;
+    open STDERR, '>&', $saveerr or die;
     chdir $old;
     open my $f, '<', $log or return {};
     my (%u, $p);
