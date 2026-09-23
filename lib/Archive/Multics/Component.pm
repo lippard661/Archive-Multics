@@ -3,7 +3,7 @@ package Archive::Multics::Component;
 use strict;
 use warnings;
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 
 # A single archive component. Mirrors archive_component_info
 # (archive_component_info.incl.pl1), plus the raw header text so that

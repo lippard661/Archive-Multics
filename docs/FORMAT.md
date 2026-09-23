@@ -125,6 +125,9 @@ module mirrors this.
 - Length in characters = `bit_count / 9`. A bit count not divisible by 9
   cannot be represented in text mode; the module refuses such
   components.
+- Object segments and other binary data have bit counts that are
+  multiples of 36, so they pass that check, but their 9th bits do not
+  survive a text-mode transfer. Nothing in the archive records this.
 - `comp_lth` (words) = ceil(bit_count / 36).
 
 ## Times

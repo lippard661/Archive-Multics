@@ -1,5 +1,10 @@
 Revision history for Archive-Multics
 
+0.03  2026-09-23
+      - Documentation: binary components (e.g. object segments) are corrupted
+        by a text-mode transfer and are not detected; corrected the claim
+        that object segments cannot be extracted.
+
 0.02  2026-09-23
       - Recognize and ignore the copyright notice that the MIT Multics source
         site appends to its archive downloads.

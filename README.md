@@ -13,9 +13,9 @@ prints on Multics.
 
 ## OpenBSD installation
 
-The OpenBSD package is `p5-Archive-Multics-0.02.tgz`:
+The OpenBSD package is `p5-Archive-Multics-0.03.tgz`:
 
-    pkg_add ./p5-Archive-Multics-0.02.tgz
+    pkg_add ./p5-Archive-Multics-0.03.tgz
 
 It installs the module, `/usr/local/bin/archive`, and the manual pages
 archive(1) and Archive::Multics(3p). The package is architecture
@@ -66,9 +66,13 @@ From Perl:
 - Two-digit years: 00-49 are 20yy and 50-99 are 19yy (RFC 5322). Multics
   MR12.8 uses 30 as the cutoff, and so misreads dates from 2030 on;
   `-P 30` reproduces it.
-- Only text-mode archives are supported. Components whose bit count is
-  not a multiple of 9 (such as object segments) are preserved but cannot
-  be extracted.
+- Only text-mode archives are supported: each 9-bit Multics character
+  becomes one byte, and its 9th bit is lost in the transfer. Source
+  archives lose nothing. Binary components, such as object segments,
+  are silently corrupted by a text-mode transfer: they still list and
+  extract, but the extracted contents are not the original. (A component
+  whose bit count is not a whole number of characters cannot be
+  extracted at all.)
 - Archives downloaded from the MIT Multics source site end with Bull's
   copyright notice, appended as a malformed extra component. It is
   recognized, ignored with a warning, and left out of anything written.

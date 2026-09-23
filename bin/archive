@@ -17,7 +17,7 @@ use Fcntl qw(:flock :mode);
 use File::Basename qw(fileparse);
 use Getopt::Long qw(:config bundling require_order no_ignore_case);
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 my $ME = 'archive';
 
 # ---------------------------------------------------------------------------
@@ -740,6 +740,13 @@ behaves like the Multics C<archive> (C<ac>) command of MR12.8: same keys,
 same arguments, same messages and the same table layout. Archives are
 read and written in text mode, one byte per 9-bit Multics character,
 as moved to and from Multics with C<encode_base64> and C<decode_base64>.
+
+Text mode keeps the low 8 bits of each 9-bit character. That loses
+nothing for text, so source archives transfer exactly, but binary
+components such as object segments are silently corrupted: B<archive>
+lists and extracts them without complaint, and the extracted contents
+are not the original. A component whose bit count is not a whole number
+of characters cannot be extracted at all.
 
 The C<.archive> suffix is added to I<archive_path> if it is missing.
 
