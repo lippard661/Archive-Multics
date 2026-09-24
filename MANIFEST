@@ -13,11 +13,10 @@ t/03-write.t
 t/04-salvage.t
 t/10-command.t
 t/11-sandbox.t
+t/12-names.t
 t/data/README
 t/data/tests.ac_t.txt
 t/data/tests.ac_tl.txt
 t/data/tests.archive
 t/lib/OpenBSD/Pledge.pm
 t/lib/OpenBSD/Unveil.pm
-META.yml                                 Module YAML meta-data (added by MakeMaker)
-META.json                                Module JSON meta-data (added by MakeMaker)

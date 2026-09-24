@@ -17,7 +17,7 @@ use Fcntl qw(:flock :mode);
 use File::Basename qw(fileparse);
 use Getopt::Long qw(:config bundling require_order no_ignore_case);
 
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 my $ME = 'archive';
 
 # ---------------------------------------------------------------------------
@@ -592,6 +592,9 @@ sub do_replace {
     for my $comp ($ar->list_components) {
         my $cname = $comp->name;
         if (!@$req) {    # global: replace from the working directory
+            # The name comes from the archive: never let it reach (and, for
+            # the delete keys, remove) a file outside the working directory.
+            next unless Archive::Multics::safe_file_name($cname);
             my $src = "$c->{cwd}/$cname";
             next unless -e $src && !-d $src;
             $put->($src, $cname, undef);
@@ -686,6 +689,12 @@ sub do_extract {
         my $cname = $comp->name;
         my $r;
         if (@$req) { $r = $want{$cname} or next; $r->{flag} = 1 }
+        unless (Archive::Multics::safe_file_name($cname)) {
+            # From the archive, not the command line: never let it name a
+            # file outside the destination directory.
+            com_err(0, "Component name \"$cname\" cannot be used as a file name; not extracted.");
+            next;
+        }
         my $ddir = $r ? $r->{dir} : '.';
         my $dest = $ddir eq '.' ? $cname : "$ddir/$cname";
         my $ddisp = display_path($ddir, $cname);
@@ -969,6 +978,13 @@ Promises: C<stdio rpath> for the table keys; C<wpath cpath fattr> added
 for keys that write files; C<flock> added for keys that rewrite the
 archive.
 
+
+Component names are taken from the archive, which may have come from
+anywhere. A name that is empty, C<.> or C<..>, or contains C</> or a NUL
+character is never used as a file name: B<x> with no names reports it
+and does not extract it, and B<r> and B<u> with no names skip it, so an
+archive cannot make B<archive> create, read or delete a file outside
+the directory it is working in.
 =head1 EXIT STATUS
 
 0 if no errors were reported, 1 otherwise.

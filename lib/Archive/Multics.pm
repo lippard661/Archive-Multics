@@ -3,7 +3,7 @@ package Archive::Multics;
 use strict;
 use warnings;
 
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 
 use Carp qw(croak);
 use Fcntl qw(:mode);
@@ -283,7 +283,8 @@ sub _parse {
         );
         $pos += $size;
     }
-    $self->_warn("$unpadded components were not padded to a word boundary",
+    $self->_warn($unpadded == 1 ? '1 component was' : "$unpadded components were",
+        ' not padded to a word boundary',
         ' (NUL bytes lost in transfer?)') if $unpadded;
     return \@comps;
 }
@@ -548,11 +549,25 @@ sub add_file {
 # Write a component to a file. Permissions come from the recorded access
 # (r, e, w -> read, execute, write, filtered by umask; a blank mode means
 # rw), and the file's mtime is set from the "modified" date.
+# True if a component name can be used as a Unix file name as it stands:
+# not empty, not "." or "..", and no "/" or NUL. Component names come from
+# the archive, which may have been crafted, so they must be checked before
+# they are used to name a file.
+sub safe_file_name {
+    my ($name) = @_;
+    return defined $name && length $name && $name ne '.' && $name ne '..'
+        && $name !~ m{[/\0]};
+}
+
 sub extract_component {
     my ($self, $name, $dest, %o) = @_;
     my $c = $self->get_component($name) or return;
     return $self->_fail(not_text => "\"$name\"") unless $c->is_text;
-    $dest //= $c->name;
+    unless (defined $dest) {
+        return $self->_fail(io => "Component name \"$name\" cannot be used as a file name.")
+            unless safe_file_name($c->name);
+        $dest = $c->name;
+    }
     if (-e $dest || -l $dest) {
         return $self->_fail(io => "$dest: File exists.") unless $o{force};
         unlink $dest or return $self->_fail(io => "$dest: $!");
@@ -728,6 +743,15 @@ The name defaults to the file's base name.
 
 Write a component to a file (see L</DESCRIPTION> for permissions and
 times). An existing file is replaced only with C<force>.
+Without C<$dest>, the file is named after the component, and a name that
+fails C<safe_file_name> is refused.
+
+=head2 Archive::Multics::safe_file_name($name)
+
+True if C<$name> can be used as a file name as it stands: not empty, not
+C<.> or C<..>, and without C</> or NUL. Component names come from the
+archive, which may have been crafted; check them with this before using
+one to name a file.
 
 =head2 warnings, trailer
 
