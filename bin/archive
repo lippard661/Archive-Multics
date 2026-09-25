@@ -17,7 +17,7 @@ use Fcntl qw(:flock :mode);
 use File::Basename qw(fileparse);
 use Getopt::Long qw(:config bundling require_order no_ignore_case);
 
-our $VERSION = '0.04';
+our $VERSION = '0.05';
 my $ME = 'archive';
 
 # ---------------------------------------------------------------------------
@@ -70,6 +70,13 @@ my %opt;
 GetOptions(
     'z|zone=s'          => \$opt{zone},
     'S|salvage'         => \$opt{salvage},
+    '9|dense9'          => \$opt{dense9},
+    '8|byte8'           => \$opt{byte8},
+    'B|bit-count'       => \$opt{bitcount},
+    'T|transfer'        => \$opt{transfer},
+    'bits=s'            => \$opt{bits},
+    'import'            => \$opt{import},
+    'export'            => \$opt{export},
     'P|century-pivot=s' => \$opt{pivot},
     'h|help'            => \$opt{help},
     'V|version'         => \$opt{version},
@@ -78,6 +85,8 @@ GetOptions(
 if ($opt{help}) {
     print <<"EOT";
 Usage: $ME [options] key archive_path {paths}
+       $ME --import transfer_file archive_path
+       $ME --export archive_path transfer_file
 
 Keys:  t tl tb tlb          table of contents
        a ad adf ca cad cadf append
@@ -91,6 +100,17 @@ Options:
   -P, --century-pivot N   2-digit years >= N are 19yy (default 50, RFC 5322;
                           30 is Multics MR12.8; "window" for a rolling window)
   -S, --salvage           read damaged archives as far as possible, with warnings
+  -9, --dense9            write the archive in dense9 (9-bit) form
+  -8, --byte8             write the archive in byte8 (one octet per character)
+  -T, --transfer          x keys: write binary components as dense9 transfer
+                          files (with their bit count), not raw dense9
+      --bits N            r, a, u keys: the one path named is raw dense9 data
+                          of bit count N (a binary extracted without -T)
+  -B, --bit-count         print the archive's bit count
+      --import            convert a dense9 transfer file (encode_base64 -dense9)
+                          to an archive
+      --export            convert an archive to a dense9 transfer file, for
+                          decode_base64 on Multics
   -h, --help              this message
   -V, --version           version
 EOT
@@ -208,6 +228,10 @@ sub new_archive_object {
         print STDERR "$ME: --century-pivot must be a number or \"window\"\n";
         exit 2;
     }
+    if ($opt{dense9} && $opt{byte8}) {
+        print STDERR "$ME: --dense9 and --byte8 cannot be used together\n";
+        exit 2;
+    }
     return Archive::Multics->new(
         validate => 'basic',    # the command reads as leniently as archive_util_
         salvage  => $opt{salvage},
@@ -220,6 +244,7 @@ sub new_archive_object {
 # Main
 
 sub main {
+    return convert() if $opt{import} || $opt{export};
     my $keyarg = shift @ARGV // usage_exit();
     if (length $keyarg > 4 || !$KEYS{$keyarg}) {
         com_err(0, "Unrecognized key - $keyarg");
@@ -262,6 +287,80 @@ sub main {
 # OpenBSD: unveil only the directories this invocation can touch, then
 # pledge only what the key needs. Done once the arguments are known and
 # before any archive or file is opened.
+
+# --import transfer_file archive_path: a dense9 transfer file to a (raw
+# dense9) archive. --export archive_path transfer_file: an archive to a
+# dense9 transfer file. The archive_path gets the .archive suffix.
+sub convert {
+    if ($opt{import} && $opt{export}) {
+        print STDERR "$ME: --import and --export cannot be used together\n";
+        exit 2;
+    }
+    my $import = $opt{import};
+    unless (@ARGV == 2) {
+        print STDERR "$ME: Usage:  $ME "
+            . ($import ? '--import transfer_file archive_path' : '--export archive_path transfer_file') . "\n";
+        $status = 1;
+        return;
+    }
+    my ($in, $out) = @ARGV;
+    if ($import) { $out .= '.archive' unless $out =~ /\.archive$/ }
+    else         { $in  .= '.archive' unless $in  =~ /\.archive$/ }
+    my $idisp = display_path(split_path($in));
+    my $odisp = display_path(split_path($out));
+
+    sandbox_convert($in, $out) if $^O eq 'openbsd';
+
+    my $ar = new_archive_object();
+    unless ($ar->read($in)) {
+        if ($ar->error_code eq 'io') { com_err(\'', $ar->error) }
+        else { com_err(0, "Format error in $idisp (" . $ar->error . ')') }
+        return;
+    }
+    print STDERR "$ME: Warning: $idisp: $_.\n" for $ar->warnings;
+    if ($import) {
+        unless ($ar->is_transfer) {
+            com_err(0, "$idisp is not a dense9 transfer file.");
+            return;
+        }
+        $ar->set_encoding('dense9', transfer => 0);
+    }
+    else {
+        $ar->set_encoding('dense9', transfer => 1);
+    }
+    if (-d $out && !-l $out) { com_err(EISDIR, $odisp); return }
+    if (-e $out || -l $out) {
+        return unless query("Name duplication. Do you want to delete the old file $odisp?");
+    }
+    unless ($ar->write($out)) { com_err(\'', $ar->error); return }
+    if ($opt{bitcount}) {
+        my $bits = $ar->bit_count;
+        info("$ME: $odisp: bit count $bits (" . $bits / 36 . ' words, dense9)');
+    }
+}
+
+sub sandbox_convert {
+    my ($in, $out) = @_;
+    require OpenBSD::Pledge;
+    require OpenBSD::Unveil;
+    my %perm;
+    my $add = sub {
+        my ($p, $how) = @_;
+        my $a = abs_path($p);
+        $perm{defined $a ? $a : $p} .= $how;
+    };
+    $add->($_, 'r') for grep { !ref && -d } @INC;
+    $add->($_, 'r') for grep { -e } qw(/usr/share/zoneinfo /etc/localtime);
+    $add->((split_path($in))[0], 'r');
+    $add->((split_path($out))[0], 'rwc');
+    for my $p (sort keys %perm) {
+        my %seen;
+        my $how = join '', grep { !$seen{$_}++ } split //, $perm{$p};
+        OpenBSD::Unveil::unveil($p, $how) or $!{ENOENT} or die "$ME: unveil $p: $!\n";
+    }
+    OpenBSD::Unveil::unveil() or die "$ME: unveil: $!\n";
+    OpenBSD::Pledge::pledge(qw(rpath wpath cpath fattr)) or die "$ME: pledge: $!\n";
+}
 
 sub sandbox {
     my ($k, $dir, $args) = @_;
@@ -356,6 +455,16 @@ sub process {
         return;
     }
 
+    # A transfer file is for moving an archive, not for working on: updates
+    # need a real archive, made with --import.
+    if ($exists && $modifies && $ar->is_transfer) {
+        com_err(0, "$disp is a dense9 transfer file; convert it with --import first.");
+        return;
+    }
+    # The form written: as read (new archives byte8) unless an option says.
+    if    ($opt{dense9}) { $ar->set_encoding('dense9', transfer => 0) }
+    elsif ($opt{byte8})  { $ar->set_encoding('byte8') }
+
     if (!$k->{empty} && $exists && !$ar->list_components) {
         com_err(0, "$disp is empty.");
         return;
@@ -405,6 +514,15 @@ sub process {
     }
     return if @args && !@req;    # arguments given, none usable
 
+    if (defined $opt{bits} && ($k->{action} ne 'replace' || @req != 1)) {
+        com_err(0, '--bits needs exactly one component path, with the r, a or u keys.');
+        return;
+    }
+    if ($opt{transfer} && $k->{action} ne 'extract') {
+        com_err(0, "-T is for the x keys only (a transfer file is recognized when it is put back) - $k->{key}");
+        return;
+    }
+
     my %ctx = (k => $k, ar => $ar, req => \@req, dir => $dir, name => $name,
                path => $path, disp => $disp, cwd => $cwd, exists => $exists,
                out_path => $out_path, lock => $lock);
@@ -413,6 +531,14 @@ sub process {
     elsif ($k->{action} eq 'replace') { do_replace(\%ctx) }
     elsif ($k->{action} eq 'delete')  { do_delete(\%ctx) }
     else                              { do_extract(\%ctx) }
+
+    # -B reports the archive as written (or read, for t and x); not after a
+    # modifying key that wrote nothing, whose -8/-9 form was never applied.
+    if ($opt{bitcount} && !$ctx{write_failed} && !$ctx{unwritten} && ($exists || $ar->list_components)) {
+        my $bits = $ar->bit_count;
+        my $out  = $k->{copy} ? display_path($cwd, $name) : $disp;
+        info("$ME: $out: bit count $bits (" . $bits / 36 . ' words, ' . $ar->encoding . ')');
+    }
 }
 
 # Exclusive lock on the archive for the whole update. The file is replaced
@@ -457,7 +583,8 @@ sub write_archive {
     }
 
     unless ($ar->write($c->{out_path})) {
-        com_err(\'', $ar->error);
+        $c->{write_failed} = 1;
+        com_err(\'', $ar->error . ($ar->error_code eq 'ninth_bit' ? ' (use --dense9)' : ''));
         com_err(0, "Archive $c->{disp} not updated.");
         return 0;
     }
@@ -578,9 +705,22 @@ sub do_replace {
             $updated_something = 1;
         }
         open my $fh, '<:raw', $src or return $fail->($!);
-        my $data = do { local $/; <$fh> } // '';
+        my $contents = do { local $/; <$fh> } // '';
         close $fh;
-        my %attr = $ar->file_attributes($src);
+        my @sd = $ar->source_data($contents, (defined $opt{bits} ? (bits => $opt{bits}) : ()));
+        print STDERR "$ME: Warning: $sdisp: $_.\n" for @{ $ar->{source_warnings} // [] };
+        unless (@sd) { my $e = $ar->error; return $fail->(\$e) }
+        my ($data, %extra) = @sd;
+        # A component with 9-bit data is only replaced from data whose bit
+        # count is known: a transfer file, or raw dense9 with --bits.
+        if (!defined $extra{bit_count} && (my $old = $ar->get_component($cname))) {
+            if ($old->has_ninth_bits) {
+                my $e = "$cname has 9-bit data; give the bit count of $sdisp with --bits,"
+                    . ' or use a transfer file (x -T).';
+                return $fail->(\$e);
+            }
+        }
+        my %attr = ($ar->file_attributes($src), %extra);
         unless ($ar->replace_component($cname, $data, %attr)) { my $e = $ar->error; return $fail->(\$e) }
         $changed = 1;
         push @delete, $src if $k->{del};
@@ -618,6 +758,7 @@ sub do_replace {
     if ($changed || ($k->{copy} && $ar->list_components)) {
         $wrote = write_archive($c) or return;
     }
+    $c->{unwritten} = 1 unless $wrote;
     my $dest = $k->{copy} ? display_path($c->{cwd}, $c->{name}) : $c->{disp};
     prefixed_info("$_ updated in $dest") for @updated_global;
 
@@ -668,6 +809,7 @@ sub do_delete {
             $changed = 1;
         }
     }
+    $c->{unwritten} = 1 unless $changed || $c->{k}{copy};
     if ($changed || $c->{k}{copy}) {
         write_archive($c) or return;
         info("$ME: All components of $c->{disp} have been deleted.")
@@ -701,8 +843,10 @@ sub do_extract {
 
         unless (-d $ddir) { com_err(ENOENT, display_path(split_path($ddir))); next }
         unless (-w $ddir) { com_err(\'Append permission missing.', abs_dir($ddir)); next }
-        unless ($comp->is_text) {
-            com_err(0, "$cname has a bit count that is not a multiple of 9; not extracted.");
+        my $binary = !$comp->is_text;
+        if ($binary && !$comp->lossless) {
+            com_err(0, "$cname has a bit count that is not a multiple of 9, and its 9th bits"
+                . " were lost in a byte8 transfer; not extracted.");
             next;
         }
         if (-e $dest || -l $dest) {
@@ -713,9 +857,15 @@ sub do_extract {
             # A symbolic link is replaced itself; its target is untouched.
             unless (unlink $dest) { com_err($!, $ddisp); next }
         }
-        unless ($ar->extract_component($cname, $dest)) {
+        unless ($ar->extract_component($cname, $dest, transfer => $opt{transfer})) {
             com_err(\'', $ar->error);
             next;
+        }
+        if ($binary) {
+            my $bc = $comp->bit_count;
+            info("$ME: $ddisp has 9-bit data; written "
+                . ($opt{transfer} ? "as a dense9 transfer file (bit count $bc)."
+                                  : "in dense9 form, bit count $bc (to put it back: --bits $bc)."));
         }
         push @remove, $comp if $k->{del};
     }
@@ -737,7 +887,11 @@ archive - Multics archive command
 
 =head1 SYNOPSIS
 
-B<archive> [B<-S>] [B<-z> I<zone>] [B<-P> I<pivot>] I<key> I<archive_path> [I<paths> ...]
+B<archive> [B<-S>] [B<-9> | B<-8>] [B<-T>] [B<--bits> I<n>] [B<-B>] [B<-z> I<zone>] [B<-P> I<pivot>] I<key> I<archive_path> [I<paths> ...]
+
+B<archive> [B<-B>] B<--import> I<transfer_file> I<archive_path>
+
+B<archive> [B<-B>] B<--export> I<archive_path> I<transfer_file>
 
 B<archive> B<-h> | B<-V>
 
@@ -746,16 +900,57 @@ B<archive> B<-h> | B<-V>
 B<archive> combines files into a single Multics archive segment and
 extracts, lists, replaces, updates and deletes its components. It
 behaves like the Multics C<archive> (C<ac>) command of MR12.8: same keys,
-same arguments, same messages and the same table layout. Archives are
-read and written in text mode, one byte per 9-bit Multics character,
-as moved to and from Multics with C<encode_base64> and C<decode_base64>.
+same arguments, same messages and the same table layout.
 
-Text mode keeps the low 8 bits of each 9-bit character. That loses
+Archives come from Multics in one of two forms, and B<archive> reads
+both, telling them apart from the first octets:
+
+=over 4
+
+=item byte8 (text mode)
+
+One octet per 9-bit character, as moved with C<encode_base64> and
+C<decode_base64>. The low 8 bits of each character are kept. That loses
 nothing for text, so source archives transfer exactly, but binary
 components such as object segments are silently corrupted: B<archive>
 lists and extracts them without complaint, and the extracted contents
 are not the original. A component whose bit count is not a whole number
 of characters cannot be extracted at all.
+
+=item dense9
+
+Every 9 bits kept: the segment's bits, big-endian, 8 characters packed
+into 9 octets, the last 72 bits padded with zeros. Its SHA-256 is what
+C<sha256 -dense9> prints for the segment on Multics.
+
+=back
+
+Multics writes dense9 as a I<transfer file>, with C<encode_base64
+-dense9>: a first line C<-dense9> I<bit count>, then the octets in
+base64. B<--import> converts a transfer file to an archive (raw dense9),
+and B<--export> converts an archive back to a transfer file for
+C<decode_base64> on Multics, with the bit count computed from its
+contents. The table and extract keys also read a transfer file directly
+(its name gets the C<.archive> suffix like any archive path), but the
+keys that change an archive refuse one: import it first.
+
+An archive is written in the form it was read in. A new archive is
+byte8, unless B<-9> is given.
+
+In a dense9 archive, a component with no 9th bits set is extracted as an
+ordinary file, whose SHA-256 is what C<sha256 -byte8> prints for it on
+Multics. A component with 9-bit data, such as an object segment, is
+extracted in dense9 form, with a message; its SHA-256 is what C<sha256 -dense9> prints. A raw dense9
+file does not record the component's bit count, so it cannot be put back
+exactly: to put a binary component back, or send it to Multics on its
+own, extract it with B<-T>, which writes a transfer file instead, or
+give the bit count (printed when it is extracted) with B<--bits>. Given
+to B<r>, B<a> or B<u>, a transfer file, or a raw file with B<--bits>,
+becomes the component again, bit for bit. (Only bits within the bit
+count are kept: any after it in the component's last word are written
+as zeros.) A component that has 9-bit data is never replaced from a file
+without a known bit count: B<r> and B<u> refuse it, and global ones skip
+it, with a message.
 
 The C<.archive> suffix is added to I<archive_path> if it is missing.
 
@@ -857,7 +1052,9 @@ Extract the named components (or all) to files. The directory part of
 each path says where the file goes; with no paths, files go in the
 working directory. The recorded access sets the permissions (r, e, w as
 read, execute, write, less the umask) and the "modified" date sets the
-modification time.
+modification time. The keys that add components record the owner's
+permissions and the modification time of each file, so a component
+extracted and put back unchanged keeps its access and "modified" date.
 
 =item B<xd>
 
@@ -889,6 +1086,46 @@ Read a damaged archive as far as possible, with a warning for each
 repair: components without word padding (NUL bytes lost in transfer),
 junk before or between components, a truncated last component, and
 trailing data. An update then writes a clean archive.
+
+=item B<-9>, B<--dense9>
+
+Write the archive in dense9 form (raw), whatever form it was read in.
+Use this to add 9-bit components to a byte8 archive, or to convert one.
+
+=item B<-8>, B<--byte8>
+
+Write the archive in byte8 form. Refused if it holds 9-bit data.
+
+=item B<-T>, B<--transfer>
+
+With the extract keys, write components that have 9-bit data as dense9
+transfer files, which record their bit count, instead of raw dense9.
+
+=item B<--bits> I<n>
+
+With the B<r>, B<a> and B<u> keys: the one component path given is raw
+dense9 data (for example a binary component extracted without B<-T>)
+with bit count I<n>. The file must be exactly 9 x ceil(I<n>/72) octets.
+The extract keys print the bit count of each binary component they
+write.
+
+=item B<--import> I<transfer_file> I<archive_path>
+
+Convert a dense9 transfer file to an archive in raw dense9 form. The
+C<.archive> suffix is added to I<archive_path> if it is missing; if the
+file exists, you are asked whether to replace it.
+
+=item B<--export> I<archive_path> I<transfer_file>
+
+Convert an archive, in either form, to a dense9 transfer file, ready for
+C<decode_base64> on Multics. If I<transfer_file> exists, you are asked
+whether to replace it.
+
+=item B<-B>, B<--bit-count>
+
+After the operation, print the archive's bit count (what Multics records
+for the segment, and what a transfer file's first line carries), its
+size in words, and its form.
 
 =item B<-z> I<zone>, B<--zone> I<zone>
 
@@ -984,7 +1221,13 @@ anywhere. A name that is empty, C<.> or C<..>, or contains C</> or a NUL
 character is never used as a file name: B<x> with no names reports it
 and does not extract it, and B<r> and B<u> with no names skip it, so an
 archive cannot make B<archive> create, read or delete a file outside
-the directory it is working in.
+the directory it is working in. Names containing control characters are
+treated the same way, and text from an archive that appears in an error
+message has any unprintable characters shown as octal escapes.
+
+A dense9 archive is at most one segment (9,400,320 bits); a larger raw
+or transfer file is refused before it is unpacked.
+
 =head1 EXIT STATUS
 
 0 if no errors were reported, 1 otherwise.

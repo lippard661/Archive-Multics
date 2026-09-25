@@ -1,5 +1,6 @@
 bin/archive
 Changes
+docs/DENSE9.md
 docs/FORMAT.md
 lib/Archive/Multics.pm
 lib/Archive/Multics/Component.pm
@@ -14,7 +15,9 @@ t/04-salvage.t
 t/10-command.t
 t/11-sandbox.t
 t/12-names.t
+t/13-dense9.t
 t/data/README
+t/data/bound_secure_hash_.dense9
 t/data/tests.ac_t.txt
 t/data/tests.ac_tl.txt
 t/data/tests.archive

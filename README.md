@@ -3,8 +3,10 @@
 Archive::Multics is a Perl module for reading and writing Multics archive
 segments, the format of the Multics `archive` command, together with
 `archive`, a Unix version of that command. It works on archives moved
-between Multics and Unix in text mode (one byte per 9-bit Multics
-character), for example with `encode_base64` and `decode_base64`.
+between Multics and Unix with `encode_base64` and `decode_base64`: in
+text mode (one byte per 9-bit Multics character), and in dense9 form
+(`encode_base64 -dense9`), which keeps every bit, so archives of object
+segments survive the round trip.
 
 Archives read and written without changes come out byte for byte
 identical, and the command's keys, messages and table layout follow
@@ -13,9 +15,9 @@ prints on Multics.
 
 ## OpenBSD installation
 
-The OpenBSD package is `p5-Archive-Multics-0.03.tgz`:
+The OpenBSD package is `p5-Archive-Multics-0.05.tgz`:
 
-    pkg_add ./p5-Archive-Multics-0.03.tgz
+    pkg_add ./p5-Archive-Multics-0.05.tgz
 
 It installs the module, `/usr/local/bin/archive`, and the manual pages
 archive(1) and Archive::Multics(3p). The package is architecture
@@ -66,13 +68,19 @@ From Perl:
 - Two-digit years: 00-49 are 20yy and 50-99 are 19yy (RFC 5322). Multics
   MR12.8 uses 30 as the cutoff, and so misreads dates from 2030 on;
   `-P 30` reproduces it.
-- Only text-mode archives are supported: each 9-bit Multics character
-  becomes one byte, and its 9th bit is lost in the transfer. Source
-  archives lose nothing. Binary components, such as object segments,
-  are silently corrupted by a text-mode transfer: they still list and
-  extract, but the extracted contents are not the original. (A component
-  whose bit count is not a whole number of characters cannot be
-  extracted at all.)
+- Two transfer forms are read, and detected automatically. In text mode
+  (byte8) each 9-bit Multics character becomes one byte and its 9th bit
+  is lost: source archives lose nothing, but binary components such as
+  object segments are silently corrupted. In dense9 form (Multics
+  `encode_base64 -dense9`) every bit is kept. `archive --import` turns a
+  `-dense9` transfer file into a raw dense9 archive, and `--export` turns
+  an archive into a transfer file for `decode_base64`. Text components
+  extract as ordinary files and binary ones as raw dense9, so SHA-256
+  digests match `sha256 -byte8` and `sha256 -dense9` on Multics; `-T`
+  extracts binaries as transfer files that can be put back bit for bit;
+  a raw one goes back with `--bits N`, the bit count printed on
+  extraction.
+  `-B` prints an archive's bit count.
 - Archives downloaded from the MIT Multics source site end with Bull's
   copyright notice, appended as a malformed extra component. It is
   recognized, ignored with a warning, and left out of anything written.

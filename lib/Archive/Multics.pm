@@ -3,12 +3,13 @@ package Archive::Multics;
 use strict;
 use warnings;
 
-our $VERSION = '0.04';
+our $VERSION = '0.05';
 
 use Carp qw(croak);
 use Fcntl qw(:mode);
 use File::Basename qw(basename dirname);
 use File::Temp ();
+use MIME::Base64 ();
 use POSIX ();
 use Archive::Multics::Component;
 
@@ -19,6 +20,11 @@ use constant IDENT        => "\f\n\n\n\x0F\n\t\t";          # archive_data_$iden
 use constant FENCE        => "\x0F\x0F\x0F\x0F\n\n\n\n";    # archive_data_$fence (= $header_end)
 use constant HEADER_BEGIN => "\x0B\n\n\n\x0F\n\t\t";        # obsolete; never recognized
 use constant HEADER_SIZE  => 100;                           # 25 words
+
+# dense9 transfers (DENSE9.md): 8 nine-bit characters per 9 octets.
+use constant MAX_BITS     => 9_400_320;                     # one 255K-word segment
+use constant MAX_OCTETS   => 9 * int((9_400_320 + 71) / 72); # its dense9 size
+use constant TRANSFER_WIDTH => 64;                          # base64 line width we write
 
 # Seconds between 1901-01-01 00:00 GMT (Multics clock epoch) and 1970-01-01.
 use constant MULTICS_EPOCH_OFFSET => 2_177_452_800;
@@ -33,6 +39,9 @@ our %MESSAGES = (
     entlong               => 'Component name is longer than 32 characters.',
     bad_name              => 'Invalid component name.',
     not_text              => 'Bit count is not a multiple of 9; component cannot be represented in text mode.',
+    ninth_bit             => 'The archive contains 9-bit data, which the byte8 format cannot represent.',
+    bad_transfer          => 'Not a valid dense9 transfer file.',
+    bad_data              => 'Component data is not 9-bit characters.',
     bad_date              => 'Invalid date.',
     io                    => 'I/O error.',
 );
@@ -52,6 +61,10 @@ sub new {
         now        => $opt{now},                 # for tests: "current" Unix time
         validate   => $opt{validate} // 'full',  # 'full' or 'basic'
         salvage    => $opt{salvage},            # skip damage instead of failing
+        force_enc  => $opt{encoding},           # 'byte8' or 'dense9': don't detect
+        encoding   => $opt{encoding} // 'byte8', # how the archive is read/written
+        transfer   => $opt{transfer} // 0,
+        transfer_opt => $opt{transfer},         # explicit: overrides the form read
         error      => '',
         error_code => '',
     }, $class;
@@ -59,6 +72,8 @@ sub new {
         unless $self->{validate} =~ /^(?:full|basic)$/;
     croak "century_pivot must be a number from 0 to 100 or 'window'"
         unless $self->{pivot} =~ /^(?:window|\d+)$/ && ($self->{pivot} eq 'window' || $self->{pivot} <= 100);
+    croak "encoding must be 'byte8' or 'dense9'"
+        if defined $opt{encoding} && $opt{encoding} !~ /^(?:byte8|dense9)$/;
     if (defined $opt{file}) {
         $self->read($opt{file}) or return;
     }
@@ -89,16 +104,223 @@ sub read {
     return $self->read_string($buf);
 }
 
+# Reads byte8 (one octet per character), raw dense9 (8 characters packed
+# in 9 octets), or a dense9 transfer file ("-dense9 N" line, then base64),
+# as detected from the first octets unless 'encoding' was given to new().
 sub read_string {
     my ($self, $buf) = @_;
-    my $comps = $self->_parse($buf) or return;
+    my ($enc, $transfer, $d9raw) = ('byte8', 0, 0);
+    my $force = $self->{force_enc} // '';
+    $self->{warnings} = [];
+    my $hi;    # dense9: the 9th bits, one octet (0 or 1) per character
+    if ($buf =~ /\A-dense9 /) {
+        return $self->_fail(not_archive => 'It is a dense9 transfer file.') if $force eq 'byte8';
+        my ($bits, $oct) = $self->_decode_transfer($buf) or return;
+        return $self->_fail(not_archive => "Bit count $bits is not a whole number of words.")
+            if $bits % 36;
+        $self->_check_pad($oct, $bits);
+        ($buf, $hi) = _unpack9_split($oct, $bits / 9);
+        ($enc, $transfer) = ('dense9', 1);
+    }
+    elsif ($force eq 'dense9' || ($force ne 'byte8' && length($buf) >= 9 && substr($buf, 0, 9) eq _dense9_ident())) {
+        return $self->_fail(not_archive => 'It is ' . length($buf) . ' octets; one segment in dense9 form is at most '
+            . MAX_OCTETS . '.') if length($buf) > MAX_OCTETS;
+        if (length($buf) % 9) {
+            return $self->_fail(not_archive => 'A raw dense9 file is a whole number of 9-octet groups.')
+                unless $self->{salvage};
+            $self->_warn('ignored ', length($buf) % 9, ' octets after the last 9-octet group');
+        }
+        ($buf, $hi) = _unpack9_split(substr($buf, 0, length($buf) - length($buf) % 9));
+        ($enc, $d9raw) = ('dense9', 1);
+    }
+    local $self->{keep_warnings} = 1;
+    my $comps = $self->_parse($buf, $d9raw, $hi) or return;
     $self->{components} = $comps;
+    ($self->{encoding}, $self->{transfer}) = ($enc, $transfer);
+    $self->{transfer} = $self->{transfer_opt} if $enc eq 'dense9' && defined $self->{transfer_opt};
     return $self->_ok;
 }
 
+# The archive as written: byte8, raw dense9, or a dense9 transfer file,
+# following the form it was read in (or set_encoding). Undef, with an
+# error, if byte8 is asked for and the archive holds 9-bit data.
 sub as_string {
     my $self = shift;
-    return join '', map { $_->_entry } @{ $self->{components} };
+    my $s = join '', map { $_->_entry } @{ $self->{components} };
+    if ($self->{encoding} eq 'dense9') {
+        my $bits = 9 * length $s;
+        return $self->_fail(io => "The archive is $bits bits; the limit is " . MAX_BITS . '.')
+            if $bits > MAX_BITS;
+        my $oct = _pack9($s, $bits);
+        return $self->{transfer} ? _encode_transfer($oct, $bits) : $oct;
+    }
+    return $self->_fail(ninth_bit => 'Write it in dense9 instead.') if $s =~ /[^\x00-\xFF]/;
+    utf8::downgrade($s);
+    return $s;
+}
+
+# The archive's bit count as it would be written: what Multics records for
+# the segment (status -bit_count), and what a transfer header carries.
+sub bit_count {
+    my $self = shift;
+    my $n = 0;
+    $n += length $_->_entry for @{ $self->{components} };
+    return 9 * $n;
+}
+
+sub encoding { $_[0]{encoding} }
+sub is_transfer { $_[0]{encoding} eq 'dense9' && $_[0]{transfer} ? 1 : 0 }
+
+# set_encoding('byte8') or set_encoding('dense9', transfer => 0|1).
+sub set_encoding {
+    my ($self, $enc, %o) = @_;
+    croak "encoding must be 'byte8' or 'dense9'" unless $enc =~ /^(?:byte8|dense9)$/;
+    $self->{encoding} = $enc;
+    $self->{transfer} = $o{transfer} // 0 if $enc eq 'dense9';
+    return 1;
+}
+
+# ---------------------------------------------------------------------------
+# dense9: bit packing and the transfer format
+
+# Pack characters (ordinals 0-511) into big-endian 9-bit fields, keep the
+# first $bits bits, and pad with zero bits to a multiple of 72.
+sub _pack9 {
+    my ($chars, $bits) = @_;
+    croak 'internal error: character above 0777 in 9-bit data' if $chars =~ /[^\x00-\x{1FF}]/;
+    my $b = join '', map { sprintf '%09b', ord } split //, $chars;
+    $bits //= length $b;
+    $b = substr($b, 0, $bits);
+    $b .= '0' x ((72 - length($b) % 72) % 72);
+    return pack 'B*', $b;
+}
+
+# Unpack octets into $n 9-bit characters (all whole ones by default).
+sub _unpack9 {
+    my ($oct, $n) = @_;
+    my ($lo, $hi) = _unpack9_split($oct, $n);
+    return _join9($lo, $hi);
+}
+
+# Unpack into two octet strings: the low 8 bits of each character, and its
+# 9th bit (0 or 1). The parser walks the first, which is an ordinary octet
+# string (a string of wide characters would make every substr at an
+# offset cost time proportional to its length).
+sub _unpack9_split {
+    my ($oct, $n) = @_;
+    my $b = unpack 'B*', $oct;
+    $n //= int(length($b) / 9);
+    my @f = unpack "(a1a8)$n", $b;
+    my $hi = pack 'C*', map { $f[2 * $_] } 0 .. $n - 1;
+    my $lo = pack '(B8)*', map { $f[2 * $_ + 1] } 0 .. $n - 1;
+    return ($lo, $hi);
+}
+
+# Characters from low octets and 9th bits; a plain octet string if no 9th
+# bit is set.
+sub _join9 {
+    my ($lo, $hi) = @_;
+    return $lo unless defined $hi && $hi =~ /[^\0]/;
+    my @h = unpack 'C*', $hi;
+    my $i = 0;
+    return join '', map { chr($_ + 256 * $h[$i++]) } unpack 'C*', $lo;
+}
+
+# archive_data_$ident is char (8) aligned: exactly one 72-bit group, so its
+# dense9 form is a fixed 9-octet string.
+{
+    my $ident9;
+    sub _dense9_ident { $ident9 //= _pack9(IDENT) }
+}
+
+sub _encode_transfer {
+    my ($oct, $bits) = @_;
+    my $b64 = MIME::Base64::encode_base64($oct, '');
+    $b64 =~ s/(.{1,${\ TRANSFER_WIDTH}})/$1\n/g;
+    return "-dense9 $bits\n$b64";
+}
+
+# Parse a transfer file ("-dense9 N", LF, base64): returns (N, octets), or
+# an empty list with an error. The octet count must be exactly
+# 9 * ceil(N / 72), as decode_base64 requires, so a truncated transfer is
+# caught.
+sub _decode_transfer {
+    my ($self, $buf) = @_;
+    $buf =~ /\A-dense9 ([0-9]{1,8})(\r?)\n/
+        or return $self->_fail(bad_transfer => 'The first line must be "-dense9 <bit count>".');
+    my ($bits, $cr) = ($1 + 0, $2);
+    $self->_warn('the "-dense9" line ends in CR LF; decode_base64 on Multics requires LF') if $cr;
+    return $self->_fail(bad_transfer => "Bit count $bits is more than one segment (" . MAX_BITS . ').')
+        if $bits > MAX_BITS;
+    my $body = substr $buf, $+[0];
+    $body =~ s/\s+//g;
+    return $self->_fail(bad_transfer => 'The body contains characters that are not base64.')
+        if $body =~ m{[^A-Za-z0-9+/=]};
+    my $want = 9 * int(($bits + 71) / 72);
+    return $self->_fail(bad_transfer => 'Its body holds ' . int(length($body) * 3 / 4)
+        . " octets; a bit count of $bits needs $want (truncated or damaged?).")
+        unless length($body) == $want / 3 * 4;
+    my $oct = MIME::Base64::decode_base64($body);
+    return $self->_fail(bad_transfer => 'It holds ' . length($oct)
+        . " octets; a bit count of $bits needs $want (truncated or damaged?).")
+        unless length($oct) == $want;
+    return ($bits, $oct);
+}
+
+# Warn if any of the pad bits after the first $bits are not zero.
+sub _check_pad {
+    my ($self, $oct, $bits) = @_;
+    my $b = unpack 'B*', $oct;
+    $self->_warn('pad bits after the bit count are not all zero')
+        if substr($b, $bits) =~ /1/;
+}
+
+# The data to archive from a source file's contents: a dense9 transfer file
+# (e.g. an extracted object segment) goes in with its exact bit count and
+# 9th bits; anything else is octets, one per character. Returns
+# ($data, %attributes), or an empty list with an error for a malformed
+# transfer file.
+#
+# With bits => N, the contents are raw dense9 octets holding a component of
+# bit count N (a raw dense9 file records no bit count): they must be
+# exactly 9 * ceil(N / 72) octets.
+sub source_data {
+    my ($self, $contents, %o) = @_;
+    $self->{source_warnings} = [];
+    if (defined(my $bits = $o{bits})) {
+        return $self->_fail(bad_data => "Bit count \"$bits\" is not a number from 0 to " . MAX_BITS . '.')
+            unless $bits =~ /^[0-9]+$/ && $bits <= MAX_BITS;
+        my $want = 9 * int(($bits + 71) / 72);
+        return $self->_fail(bad_data => 'The file is a dense9 transfer file, which'
+            . ' records its own bit count; give it without a bit count.')
+            if $contents =~ /\A-dense9 /;
+        return $self->_fail(bad_data => 'The file is ' . length($contents)
+            . " octets; raw dense9 data of bit count $bits is $want.")
+            unless length($contents) == $want;
+        local $self->{warnings} = [];
+        $self->_check_pad($contents, $bits);
+        $self->{source_warnings} = [ @{ $self->{warnings} } ];
+        return (_unpack9($contents, int(($bits + 8) / 9)), bit_count => $bits + 0);
+    }
+    my @t = $self->_transfer_contents($contents);
+    return if @t == 1;
+    return ($t[1], bit_count => $t[0]) if @t;
+    return ($contents);
+}
+
+# Is this data (e.g. a file's contents) a dense9 transfer? Returns
+# (bits, characters) if so, () if it is not one, and undef on a malformed
+# transfer (with an error).
+# Only a first line of exactly "-dense9 <digits>" makes it one; a text file
+# that merely starts with "-dense9 " is text.
+sub _transfer_contents {
+    my ($self, $data) = @_;
+    return () unless $data =~ /\A-dense9 [0-9]{1,8}\r?\n/;
+    local $self->{warnings} = [];
+    my ($bits, $oct) = $self->_decode_transfer($data) or return undef;
+    $self->_check_pad($oct, $bits);
+    $self->{source_warnings} = [ @{ $self->{warnings} } ];
+    return ($bits, _unpack9($oct, int(($bits + 8) / 9)));
 }
 
 # Write atomically: build a temp file in the target directory and rename it
@@ -106,6 +328,8 @@ sub as_string {
 sub write {
     my ($self, $path) = @_;
     $path //= $self->{path} // croak "no path given";
+    my $out = $self->as_string;
+    return unless defined $out;
     my $dir = dirname($path);
     my $mode;
     if (my @st = stat $path) { $mode = S_IMODE($st[2]) }
@@ -113,7 +337,7 @@ sub write {
     my $tmp = eval { File::Temp->new(DIR => $dir, TEMPLATE => '.archive.XXXXXXXX', UNLINK => 0) }
         or return $self->_fail(io => "$dir: cannot create temporary file: $@");
     binmode $tmp;
-    my $ok = print {$tmp} $self->as_string;
+    my $ok = print {$tmp} $out;
     $ok &&= close $tmp;
     unless ($ok && chmod($mode, $tmp->filename) && rename($tmp->filename, $path)) {
         my $err = $!;
@@ -144,25 +368,29 @@ sub _mit_notice_at {
 
 # Check the header at $pos. Returns a hash of its fields, or an error string.
 sub _header_at {
-    my ($self, $buf, $pos) = @_;
+    my ($self, $buf, $pos, $hi) = @_;
     return 'Fewer than 25 words remain for a header.' if length($buf) - $pos < HEADER_SIZE;
     my %h;
+    my $hd = substr $buf, $pos, HEADER_SIZE;
     @h{qw(begin pad1 name timeup mode time pad bcf end)} =
-        unpack 'a8 a4 a32 a16 a4 a16 a4 a8 a8', substr($buf, $pos, HEADER_SIZE);
+        map { substr $hd, $_->[0], $_->[1] } [0, 8], [8, 4], [12, 32], [44, 16], [60, 4],
+                                            [64, 16], [80, 4], [84, 8], [92, 8];
     return 'Header does not begin with archive_data_$ident.' if $h{begin} ne IDENT;
+    return 'Header contains a character with the 9th bit set.' if $hi && substr($hi, $pos, HEADER_SIZE) =~ /[^\0]/;
     return 'Header does not end with archive_data_$fence.'   if $h{end} ne FENCE;
     (my $bct = $h{bcf}) =~ s/^ +| +$//g;
-    return qq{Bit count field "$h{bcf}" is not a number.} unless $bct =~ /^[0-9]+$/;
+    return 'Bit count field "' . _printable($h{bcf}) . '" is not a number.' unless $bct =~ /^[0-9]+$/;
     return 'Date field contains invalid characters.'
         if $h{timeup} =~ m{[^0-9 ./]} || $h{time} =~ m{[^0-9 ./]};
     return 'Mode field contains invalid characters.' if $h{mode} =~ /[^rewa ]/;
     ($h{cname} = $h{name}) =~ s/ +$//;
     $h{bc} = $bct + 0;
     if ($self->{validate} eq 'full') {
-        return qq{($h{cname}) Mode field "$h{mode}" is malformed.}
+        my $cn = _printable($h{cname});
+        return qq{($cn) Mode field "$h{mode}" is malformed.}
             unless $h{mode} =~ /^[r ][e ][w ][a ]$/;
         for ([modified => $h{time}], [updated => $h{timeup}]) {
-            return qq{($h{cname}) Date $_->[0] "$_->[1]" is invalid.}
+            return qq{($cn) Date $_->[0] "$_->[1]" is invalid.}
                 unless defined $self->_parse_date($_->[1]);
         }
     }
@@ -171,11 +399,27 @@ sub _header_at {
 
 sub _warn { my $self = shift; push @{ $self->{warnings} }, join '', @_ }
 
+# Text from an archive, safe to print: characters outside printable ASCII
+# as octal escapes, so a crafted field cannot send terminal controls.
+sub _printable {
+    my ($s) = @_;
+    $s =~ s/([^\x20-\x7E])/sprintf '\\%03o', ord $1/ge;
+    return $s;
+}
+
 sub _parse {
-    my ($self, $buf) = @_;
+    my ($self, $buf, $d9raw, $hi) = @_;
     my $len     = length $buf;
+    my $unit    = defined $hi ? 'characters' : 'bytes';
+    # Characters $p .. $p+$l-1 (with their 9th bits, in dense9).
+    my $chars_at = sub {
+        my ($p, $l) = @_;
+        my $s = substr $buf, $p, $l;
+        return $s unless defined $hi;
+        return _join9($s, substr $hi, $p, $l);
+    };
     my $salvage = $self->{salvage};
-    $self->{warnings} = [];
+    $self->{warnings} = [] unless $self->{keep_warnings};
     $self->{trailer}  = '';
 
     # Where the MIT notice starts, if there is one.
@@ -213,57 +457,61 @@ sub _parse {
         if ($pos < 0) {
             return $self->_fail(not_archive => 'No component header found.');
         }
-        $self->_warn("skipped $pos bytes before the first component header") if $pos;
+        $self->_warn("skipped $pos $unit before the first component header") if $pos;
     }
 
     my (@comps, $unpadded);
     while ($pos < $len) {
+        # A raw dense9 file is padded to 72 bits: an archive with an odd
+        # number of words ends with one zero pad word.
+        last if $d9raw && $pos == $len - 4 && substr($buf, $pos, 4) eq "\0" x 4;
         if ($mit_here->($pos)) { $stop_mit->($pos); last }
         my $n = @comps + 1;
         my $where = "Component $n at word " . int($pos / 4) . '.';
-        my $h = $self->_header_at($buf, $pos);
+        my $h = $self->_header_at($buf, $pos, $hi);
 
         unless (ref $h) {
             return $self->_fail(archive_fmt_err => "$where $h") unless $salvage;
             my $next = index $buf, IDENT, $pos + 1;
-            while ($next >= 0 && !ref $self->_header_at($buf, $next)) {
+            while ($next >= 0 && !ref $self->_header_at($buf, $next, $hi)) {
                 $next = index $buf, IDENT, $next + 1;
             }
             if ($next < 0) {
                 $self->{trailer} = substr $buf, $pos;
-                $self->_warn('ignored ', $len - $pos, " bytes at byte $pos ($h)");
+                $self->_warn('ignored ', $len - $pos, " $unit at $pos ($h)");
                 last;
             }
-            $self->_warn('skipped ', $next - $pos, " bytes at byte $pos ($h)");
+            $self->_warn('skipped ', $next - $pos, " $unit at $pos ($h)");
             $pos = $next;
             next;
         }
 
         my $bc     = $h->{bc};
         my $chars  = int($bc / 9);
+        my $cchars = int(($bc + 8) / 9);                     # including a partial last one
         my $size   = HEADER_SIZE + 4 * int(($bc + 35) / 36);
-        my $data_e = $pos + HEADER_SIZE + $chars;            # end of the data
+        my $data_e = $pos + HEADER_SIZE + $cchars;           # end of the data
         my $at_boundary = sub { my $p = shift; $p == $len || substr($buf, $p, 8) eq IDENT || $mit_here->($p) };
         my $raw;
 
         my $padded = $pos + $size <= $len
-            && substr($buf, $data_e, $size - HEADER_SIZE - $chars) !~ /[^\0]/;
+            && substr($buf, $data_e, $size - HEADER_SIZE - $cchars) !~ /[^\0]/;
 
         if (!$salvage) {
             return $self->_fail(archive_fmt_err => "$where Component extends past the end of the archive.")
                 if $pos + $size > $len;
-            $raw = substr $buf, $pos, $size;
+            $raw = $chars_at->($pos, $size);
         }
         elsif ($padded && $at_boundary->($pos + $size)) {
-            $raw = substr $buf, $pos, $size;
+            $raw = $chars_at->($pos, $size);
         }
         elsif ($data_e <= $len && $at_boundary->($data_e)) {    # no word padding
-            $raw = substr($buf, $pos, HEADER_SIZE + $chars) . ("\0" x ($size - HEADER_SIZE - $chars));
-            $size = HEADER_SIZE + $chars;
+            $raw = $chars_at->($pos, HEADER_SIZE + $cchars) . ("\0" x ($size - HEADER_SIZE - $cchars));
+            $size = HEADER_SIZE + $cchars;
             $unpadded++;
         }
         elsif ($pos + $size <= $len) {                          # padded, junk follows
-            $raw = substr $buf, $pos, $size;
+            $raw = $chars_at->($pos, $size);
         }
         else {
             $self->_warn("dropped component $n ($h->{cname}): it extends past the end of the archive");
@@ -278,8 +526,10 @@ sub _parse {
             mode      => $h->{mode},
             timeup    => $h->{timeup},
             time      => $h->{time},
-            data      => substr($buf, $pos + HEADER_SIZE, $chars),
+            data      => substr($raw, HEADER_SIZE, $chars),
+            cdata     => substr($raw, HEADER_SIZE, $cchars),
             raw       => $raw,
+            lossless  => defined $hi ? 1 : 0,
         );
         $pos += $size;
     }
@@ -441,18 +691,28 @@ sub _normalize_mode {
     return join('', map { index($m, $_) >= 0 ? $_ : ' ' } qw(r e w)) . ' ';
 }
 
+# $data is characters (octets for text). For 9-bit data, bit_count => N
+# gives the exact bit count and $data holds ceil(N / 9) characters.
 sub _make_component {
     my ($self, $name, $data, %a) = @_;
     $self->_check_new_name($name) or return;
     my $now = $a{time_updated} // time;
+    my $bc  = $a{bit_count} // 9 * length($data);
+    return $self->_fail(bad_data => "Bit count \"$bc\" is not a number from 0 to " . MAX_BITS . '.')
+        unless $bc =~ /^[0-9]+$/ && $bc <= MAX_BITS;
+    return $self->_fail(bad_data => "Bit count $bc does not match the data.")
+        unless length($data) == int(($bc + 8) / 9);
+    return $self->_fail(bad_data => 'A character is above octal 777.') if $data =~ /[^\x00-\x{1FF}]/;
     return Archive::Multics::Component->_new(
         archive   => $self,
         name      => $name,
-        bit_count => 9 * length($data),
+        bit_count => $bc,
+        cdata     => $data,
+        data      => substr($data, 0, int($bc / 9)),
+        lossless  => 1,
         mode      => _normalize_mode($a{access}),
         timeup    => $self->_format_date($now),
         time      => $self->_format_date($a{time_modified} // $now),
-        data      => $data,
     );
 }
 
@@ -520,13 +780,15 @@ sub delete_component {
 # ---------------------------------------------------------------------------
 # Files
 
-# Attributes Multics would record for a source segment: its dtcm and the
-# user's effective access.
+# Attributes Multics would record for a source segment: its dtcm and access
+# (Multics records the user's effective mode; here, the owner's bits).
 sub file_attributes {
     my ($self, $path) = @_;
     my @st = stat $path or return $self->_fail(io => "$path: $!");
     return $self->_fail(io => "$path: Not a plain file.") unless -f _;
-    my $access = (-r _ ? 'r' : '') . (-x _ ? 'e' : '') . (-w _ ? 'w' : '');
+    # The owner's permission bits, the counterpart of the access that
+    # extraction sets (-r and -w would always be true for root).
+    my $access = ($st[2] & 0400 ? 'r' : '') . ($st[2] & 0100 ? 'e' : '') . ($st[2] & 0200 ? 'w' : '');
     return (time_modified => $st[9], access => $access);
 }
 
@@ -538,6 +800,9 @@ sub add_file {
     local $/;
     my $data = <$fh> // '';
     close $fh;
+    my @sd = $self->source_data($data, (defined $o{bits} ? (bits => $o{bits}) : ())) or return;
+    ($data, my %extra) = @sd;
+    %attr = (%attr, %extra);
     my $name   = $o{name} // basename($path);
     my $action = $o{action} // 'replace';
     return $self->replace_component($name, $data, %attr) if $action eq 'replace';
@@ -556,13 +821,20 @@ sub add_file {
 sub safe_file_name {
     my ($name) = @_;
     return defined $name && length $name && $name ne '.' && $name ne '..'
-        && $name !~ m{[/\0]};
+        && $name !~ m{[/\x00-\x1F\x7F]};
 }
 
 sub extract_component {
     my ($self, $name, $dest, %o) = @_;
     my $c = $self->get_component($name) or return;
-    return $self->_fail(not_text => "\"$name\"") unless $c->is_text;
+    # A component that is not text is written in dense9 form: raw octets
+    # (whose SHA-256 is sha256 -dense9 of the segment on Multics), or with
+    # transfer => 1 a transfer file, which keeps the bit count. Only if all
+    # its bits are known: not if it was read from a byte8 archive, where
+    # the 9th bits were lost.
+    my $binary = !$c->is_text;
+    return $self->_fail(not_text => "\"$name\"")
+        if $binary && !$c->lossless;
     unless (defined $dest) {
         return $self->_fail(io => "Component name \"$name\" cannot be used as a file name.")
             unless safe_file_name($c->name);
@@ -578,10 +850,12 @@ sub extract_component {
              | (substr($m, 1, 1) eq 'e' ? 0111 : 0)
              | (substr($m, 2, 1) eq 'w' ? 0222 : 0);
     $perm &= ~umask;
+    my $out = !$binary ? $c->data : $o{transfer} ? $c->transfer_string : $c->dense9;
+    utf8::downgrade($out);
     sysopen my $fh, $dest, Fcntl::O_WRONLY() | Fcntl::O_CREAT() | Fcntl::O_EXCL(), 0600
         or return $self->_fail(io => "$dest: $!");
     binmode $fh;
-    print {$fh} $c->data or return $self->_fail(io => "$dest: $!");
+    print {$fh} $out or return $self->_fail(io => "$dest: $!");
     close $fh            or return $self->_fail(io => "$dest: $!");
     my $mtime = $c->time_modified;
     utime $mtime, $mtime, $dest if defined $mtime;
@@ -618,8 +892,10 @@ Archive::Multics - read and write Multics archive segments
 =head1 DESCRIPTION
 
 Archive::Multics reads and writes archives in the format used by the
-Multics C<archive> command, as transferred to Unix in text mode (one
-8-bit byte per 9-bit Multics character). It follows the MR12.8
+Multics C<archive> command, as transferred to Unix either in text mode
+("byte8": one octet per 9-bit Multics character, 9th bit lost) or in
+"dense9" form (every bit kept, 8 characters in 9 octets), raw or as a
+C<-dense9> I<N> transfer file with a base64 body. It follows the MR12.8
 C<archive_> subroutine for reading and C<archive> for writing, so an
 archive read and written without changes is byte-for-byte identical, and
 unchanged components keep their original headers.
@@ -665,6 +941,21 @@ before or between components is skipped, a truncated last component and
 any trailing data are dropped. Each repair is reported by C<warnings>.
 Writing such an archive produces a clean one.
 
+=item encoding
+
+C<byte8> or C<dense9>: read the archive in this form instead of
+detecting it, and write it in this form. With C<dense9>, a transfer file
+is still recognized by its first line; with C<byte8>, one is refused. Without it, the form is detected: a transfer
+file, then the 9-octet dense9 form of C<archive_data_$ident> at offset 0,
+otherwise byte8. New archives are byte8.
+
+=item transfer
+
+Whether a dense9 archive is written as a transfer file (true) or as raw
+octets (false). If given, it applies whatever form a dense9 archive was
+read in; if not, the form read is kept, and a new dense9 archive is
+raw.
+
 =item file
 
 Read this archive immediately.
@@ -675,7 +966,29 @@ Read this archive immediately.
 
 =head2 read($path), read_string($bytes)
 
-Read an archive from a file or a string. Returns false on error.
+Read an archive from a file or a string, in any of the three forms.
+Returns false on error.
+
+=head2 encoding, is_transfer, set_encoding($enc, transfer => $bool)
+
+The form the archive is read in and will be written in (C<byte8> or
+C<dense9>), whether a dense9 archive is written as a transfer file, and
+a way to change both. Writing byte8 fails with C<ninth_bit> if any
+component has 9-bit data.
+
+=head2 bit_count
+
+The archive's bit count as it would be written: the segment's bit count
+on Multics, and the number in a transfer file's first line.
+
+=head2 source_data($contents, bits => $n)
+
+What a source file's contents become as a component: a dense9 transfer
+file gives its characters and C<bit_count =E<gt> N>; anything else is
+octets; with C<bits>, the contents are raw dense9 data of that bit
+count. Returns C<($data, %attributes)> for C<replace_component> and the
+like, or an empty list (with an error) if a transfer file is malformed or
+the length does not fit C<bits>.
 
 =head2 write([$path]), as_string
 
@@ -734,15 +1047,27 @@ Delete the first component with this name.
 
 Remove a particular component object.
 
-=head2 add_file($path, action => 'replace'|'append'|'update', name => $name)
+=head2 add_file($path, action => 'replace'|'append'|'update', name => $name, bits => $n)
 
 Add a file as a component, with its modification time and access.
-The name defaults to the file's base name.
+The name defaults to the file's base name. A dense9 transfer file (such
+as a binary component extracted earlier) is added with its exact bit
+count and 9th bits. With C<bits>, the file is taken as raw dense9 data of
+that bit count, and must be exactly C<9 * ceil(bits / 72)> octets.
 
-=head2 extract_component($name, [$dest], force => 1)
+=head2 extract_component($name, [$dest], force => 1, transfer => 1)
 
 Write a component to a file (see L</DESCRIPTION> for permissions and
-times). An existing file is replaced only with C<force>.
+times). An existing file is replaced only with C<force>. A component
+that is not text (9th bits set, or a bit count that is not a whole
+number of characters) is written in dense9 form, as raw octets (whose
+SHA-256 is C<sha256 -dense9> of the segment on Multics) or, with
+C<transfer>, as a transfer file, which records the bit count so that the
+file can be added back exactly. Either only if all its bits are known
+(C<lossless>: read from a dense9 archive, or made from a file); a
+component read from a byte8 archive, whose 9th bits were lost, is
+refused with C<not_text>. Bits after the bit count in the last word are
+written as zeros.
 Without C<$dest>, the file is named after the component, and a name that
 fails C<safe_file_name> is refused.
 
@@ -768,12 +1093,16 @@ ignored with a warning, and not written back.
 Also available as C<$Archive::Multics::error> and
 C<$Archive::Multics::error_code>. Codes: C<not_archive>,
 C<archive_fmt_err>, C<no_component>, C<namedup>, C<entlong>,
-C<bad_name>, C<not_text>, C<io>.
+C<bad_name>, C<not_text>, C<ninth_bit>, C<bad_transfer>, C<bad_data>,
+C<io>.
 
 =head1 COMPONENT METHODS
 
 C<name>, C<bit_count>, C<length> (words), C<size> (characters),
-C<is_text>, C<data>, C<access>, C<readable>, C<executable>,
+C<is_text> (octets lose nothing), C<has_ninth_bits>, C<lossless>
+(every bit known), C<data>,
+C<dense9> (the component's bits, packed), C<transfer_string> (as a
+dense9 transfer file), C<access>, C<readable>, C<executable>,
 C<writable>, C<mode_field>, C<time_updated>, C<time_modified>
 (Unix times), C<time_updated_string>, C<time_modified_string>
 (raw header text), C<multics_time_updated>, C<multics_time_modified>

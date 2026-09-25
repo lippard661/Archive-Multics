@@ -18,3 +18,10 @@ tests.ac_t.txt, tests.ac_tl.txt
 
 The two-digit-year tests in 01-read.t use clock values returned by
 convert_date_to_binary_ on Multics MR12.8.
+
+bound_secure_hash_.dense9
+    bound_secure_hash_.archive from Multics (2026-09-24), exported with
+    encode_base64 -dense9, header line removed and base64 decoded: a raw
+    dense9 archive of 207,000 bits (5,750 words). Components: the object
+    segments secure_hash_ (127,080 bits) and sha256 (70,200 bits), with
+    9th bits set, and the bindfile bound_secure_hash_.bind (7,002 bits).

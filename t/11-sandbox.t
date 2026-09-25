@@ -26,7 +26,7 @@ sub sandbox_for {
     open STDOUT, '>', File::Spec->devnull or die;
     open STDERR, '>', File::Spec->devnull or die;
     system $^X, "-I$ROOT/t/lib", "-I$ROOT/lib", '-e',
-        '$^O = "openbsd"; @ARGV = @ARGV; do $ENV{CMD}; die $@ if $@', @args;
+        '$^O = "openbsd"; @ARGV = @ARGV; do $ENV{CMD}; die $@ if $@', '--', @args;
     open STDOUT, '>&', $saveout or die;
     open STDERR, '>&', $saveerr or die;
     chdir $old;
@@ -70,5 +70,14 @@ is $s->{unveil}{$out}, 'rwc', 'cr: working directory writable for the copy';
 symlink "$src/f", "$out/lnk" or die;
 $s = sandbox_for($d, 'r', 'x', "$out/lnk");
 is $s->{unveil}{$src}, 'r', 'symlinked source: target directory unveiled';
+
+$s = sandbox_for($out, '--export', "$d/x", "$out/x.b64");
+is $s->{pledge}, 'rpath wpath cpath fattr', '--export: write promises, no flock';
+is $s->{unveil}{$d}, 'r', '--export: archive directory read-only';
+is $s->{unveil}{$out}, 'rwc', '--export: output directory writable';
+
+$s = sandbox_for($d, '--import', "$out/x.b64", "$src/y");
+is $s->{unveil}{$out}, 'r', '--import: transfer file directory read-only';
+is $s->{unveil}{$src}, 'rwc', '--import: archive directory writable';
 
 done_testing;

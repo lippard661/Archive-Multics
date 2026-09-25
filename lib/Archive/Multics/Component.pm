@@ -3,7 +3,7 @@ package Archive::Multics::Component;
 use strict;
 use warnings;
 
-our $VERSION = '0.04';
+our $VERSION = '0.05';
 
 # A single archive component. Mirrors archive_component_info
 # (archive_component_info.incl.pl1), plus the raw header text so that
@@ -14,7 +14,9 @@ our $VERSION = '0.04';
 #   bit_count      comp_bc
 #   raw            header (100 bytes) + data + padding, exactly as read;
 #                  undef for new or changed components
-#   data           component contents in text mode (bit_count / 9 bytes)
+#   data           component contents in text mode (bit_count / 9 characters)
+#   cdata          all ceil(bit_count / 9) characters, including a last
+#                  partial one; characters are 0-511 in a dense9 archive
 #   mode           4-char mode field, e.g. "r w "
 #   timeup         16-char "updated" field
 #   time           16-char "modified" field
@@ -39,8 +41,31 @@ sub length    { int(($_[0]{bit_count} + 35) / 36) }
 # Size in text-mode bytes, i.e. Multics characters.
 sub size      { int($_[0]{bit_count} / 9) }
 
-# True if the bit count is a whole number of 9-bit characters.
-sub is_text   { $_[0]{bit_count} % 9 == 0 }
+# True if the component can be written as ordinary octets without losing
+# anything: a whole number of characters, none with the 9th bit set. (In a
+# byte8 archive the 9th bits are already gone, so only the bit count
+# counts.)
+sub is_text   { $_[0]{bit_count} % 9 == 0 && !$_[0]->has_ninth_bits ? 1 : 0 }
+
+# True if every bit of the component is known: read from a dense9 archive,
+# or made from a file. False if read from byte8, where 9th bits were lost.
+sub lossless { $_[0]{lossless} ? 1 : 0 }
+
+# True if any character has its 9th bit set (only possible in dense9).
+sub has_ninth_bits { ($_[0]{cdata} // $_[0]{data}) =~ /[^\x00-\xFF]/ ? 1 : 0 }
+
+# The component's bits in dense9 form: big-endian, 9 octets per 72 bits,
+# the last group padded with zero bits.
+sub dense9 {
+    my $self = shift;
+    return Archive::Multics::_pack9($self->{cdata} // $self->{data}, $self->{bit_count});
+}
+
+# The component as a dense9 transfer file, as decode_base64 reads it.
+sub transfer_string {
+    my $self = shift;
+    return Archive::Multics::_encode_transfer($self->dense9, $self->{bit_count});
+}
 
 sub data      { $_[0]{data} }
 *content = \&data;
@@ -86,7 +111,7 @@ sub header {
 sub _entry {
     my $self = shift;
     return $self->{raw} if defined $self->{raw};
-    my $data = $self->{data};
+    my $data = $self->{cdata} // $self->{data};
     my $pad  = (4 - CORE::length($data) % 4) % 4;
     return $self->header . $data . ("\0" x $pad);
 }

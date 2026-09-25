@@ -1,5 +1,41 @@
 Revision history for Archive-Multics
 
+0.05  2026-09-25
+      - dense9 archives: every 9 bits kept, 8 characters in 9 octets, as
+        written on Multics by encode_base64 -dense9. A raw dense9 archive
+        has the SHA-256 that sha256 -dense9 gives on Multics.
+      - archive --import converts a transfer file ("-dense9 N" line,
+        base64 body) to a raw dense9 archive; archive --export converts
+        an archive to a transfer file for decode_base64, with the bit
+        count computed from the contents. t and x also read transfer
+        files; the keys that change an archive refuse them.
+      - Binary components (9th bits set) extract as raw dense9, with the
+        SHA-256 that sha256 -dense9 gives; -T/--transfer extracts them as
+        transfer files, which record the bit count and can be put back
+        bit for bit. x prints each binary's bit count, and --bits N puts
+        a raw dense9 file back with r, a or u. A component with 9-bit
+        data is not replaced from a file without a known bit count (a
+        transfer file, or --bits): r and u refuse or skip it. -T is
+        refused with keys other than x, and --bits with a transfer file.
+        Text components extract as ordinary files, with the SHA-256
+        that sha256 -byte8 gives.
+      - archive(1): -9/--dense9 and -8/--byte8 choose the form written;
+        -B/--bit-count prints the archive's bit count.
+      - Archive::Multics: encoding and transfer options; bit_count,
+        encoding, is_transfer, set_encoding, source_data; component
+        has_ninth_bits, lossless, dense9 and transfer_string. A header
+        with a 9th bit set is a format error.
+      - Access modes round-trip: binary components keep execute
+        permission when extracted (as text ones always did), and the
+        mode recorded for an added file comes from its owner permission
+        bits rather than effective access (which is always writable for
+        root). A component extracted and put back unchanged keeps its
+        mode and "modified" date; only "updated" changes.
+      - Security hardening: a component name containing a control
+        character is never used as a file name; archive text in error
+        messages is shown with unprintable characters escaped; dense9
+        input larger than one segment is refused before it is unpacked.
+
 0.04  2026-09-23
       - Security: component names come from the archive and were used as
         file names unchecked. A crafted archive could make "archive x"
