@@ -89,25 +89,28 @@ a name, and a name would be untrusted input that must never be used as a
 path. (The earlier RFC 822-style wrapper proposal is superseded by this
 format.)
 
-## Multics side: `multics_octets_`
+## Multics side: `convert_dense9_`
 
-There is no Multics tool yet that writes dense9. Proposed:
+The dense9 packing is now a Multics subroutine, `convert_dense9_`, with
+entry points `$pack` and `$unpack`. (Proposed earlier as
+`multics_octets_`, with byte8 entries as well; byte8 needs no packer.)
 
-- A new subroutine, `multics_octets_`, with `$pack_dense9`,
-  `$unpack_dense9`, `$pack_byte8`, `$unpack_byte8`, working on buffers
-  (bulk, not per octet), and arguably `bit_to_hex` and a new `hex_to_bit`
-  moved from `secure_hash_`, where they never belonged.
-- `encode_base64 -dense9` / `decode_base64` (the transfer format above)
-  built on it.
-- `secure_hash_`'s dense9 path currently calls out once per octet (about
-  200,000 calls for a typical archive), the pattern that cost 2.8x in its
-  byte8 path before that was removed, and it was never benchmarked. Having
-  it call `$pack_dense9` per block would share one implementation and
-  probably make it faster. Measure `sha256 -dense9` against `-byte8` on
-  the same file first. Its byte8 path needs no packer and stays as it is.
-- The specification to share, whatever the code arrangement, is the
-  72-bit padding rule. Test it: pack a segment with the transport, hash it
-  with `sha256 -dense9`, and compare.
+- `encode_base64 -dense9` writes the transfer format above.
+  `decode_base64` takes no new arguments: it recognizes the
+  `-dense9 <bitcount>` header and decodes accordingly; without it, it
+  decodes as before. Both use `convert_dense9_` for the packing.
+- `secure_hash_` has not yet been changed to use `convert_dense9_`; that
+  is planned. Its dense9 path calls out once per octet (about 200,000
+  calls for a typical archive), the pattern that cost 2.8x in its byte8
+  path before that was removed. Calling `convert_dense9_$pack` per block
+  would share one implementation and probably be faster; measure
+  `sha256 -dense9` against `-byte8` on the same file before and after.
+- `bit_to_hex` remains in `secure_hash_` (as would a `hex_to_bit` to go
+  with it); a general-purpose home for them is still an open question.
+- The rule shared by `convert_dense9_`, `secure_hash_` and
+  Archive::Multics is the 72-bit padding. Test it: pack a segment with
+  `convert_dense9_$pack`, hash it with `sha256 -dense9`, and compare; and
+  compare both with Archive::Multics on the same segment.
 
 ## Detection (at open time)
 
