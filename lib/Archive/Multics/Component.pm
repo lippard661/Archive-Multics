@@ -117,3 +117,27 @@ sub _entry {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Archive::Multics::Component - one component of a Multics archive
+
+=head1 SYNOPSIS
+
+    for my $c ($archive->list_components) {
+        printf "%-32s %8d\n", $c->name, $c->bit_count;
+    }
+
+=head1 DESCRIPTION
+
+Components are made by L<Archive::Multics> (C<list_components>,
+C<get_component> and the like); they are not created directly. Their
+methods are listed under COMPONENT METHODS in L<Archive::Multics>.
+
+=head1 SEE ALSO
+
+L<Archive::Multics>, L<archive(1)>
+
+=cut

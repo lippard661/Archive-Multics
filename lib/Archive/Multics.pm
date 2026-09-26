@@ -36,6 +36,7 @@ our %MESSAGES = (
     archive_fmt_err       => 'Format error encountered in archive segment.',
     no_component          => 'Component not found in archive.',
     namedup               => 'Component already in archive.',
+    dupname               => 'Component name occurs more than once in archive.',
     entlong               => 'Component name is longer than 32 characters.',
     bad_name              => 'Invalid component name.',
     not_text              => 'Bit count is not a multiple of 9; component cannot be represented in text mode.',
@@ -136,6 +137,13 @@ sub read_string {
     local $self->{keep_warnings} = 1;
     my $comps = $self->_parse($buf, $d9raw, $hi) or return;
     $self->{components} = $comps;
+    # The archive command never makes two components with the same name,
+    # but joined or crafted archives can hold them. Say so: by name, only
+    # the first can be found, and some keys act on all of them.
+    my %n;
+    $n{ $_->name }++ for @$comps;
+    $self->_warn('component name "', _printable($_), "\" occurs $n{$_} times")
+        for grep { $n{$_} > 1 } sort keys %n;
     ($self->{encoding}, $self->{transfer}) = ($enc, $transfer);
     $self->{transfer} = $self->{transfer_opt} if $enc eq 'dense9' && defined $self->{transfer_opt};
     return $self->_ok;
@@ -719,6 +727,10 @@ sub _make_component {
 # Replace the named component in place, or append it (key "r").
 sub replace_component {
     my ($self, $name, $data, %a) = @_;
+    # Which of several components with this name is meant is unknowable;
+    # replacing them all with the same data is rarely wanted. Refuse.
+    return $self->_fail(dupname => "\"$name\"")
+        if (grep { $_->name eq $name } @{ $self->{components} }) > 1;
     my $new = $self->_make_component($name, $data, %a) or return;
     my $i = $self->_index_of($name);
     if (defined $i) { $self->{components}[$i] = $new }
@@ -826,7 +838,11 @@ sub safe_file_name {
 
 sub extract_component {
     my ($self, $name, $dest, %o) = @_;
-    my $c = $self->get_component($name) or return;
+    # A component object (from list_components) selects that component,
+    # even if an earlier one has the same name.
+    my $c = ref $name ? $name : $self->get_component($name);
+    return unless $c;
+    $name = $c->name;
     # A component that is not text is written in dense9 form: raw octets
     # (whose SHA-256 is sha256 -dense9 of the segment on Multics), or with
     # transfer => 1 a transfer file, which keeps the bit count. Only if all
@@ -1002,7 +1018,9 @@ All components (objects) or their names, in archive order.
 =head2 get_component($name) (alias get_component_info)
 
 Returns the first component with that name, or undef with
-C<error_code> C<no_component>. Names longer than 32 characters are an
+C<error_code> C<no_component>. (The archive command never makes two
+components with the same name, but a joined or crafted archive can hold
+them; reading such an archive gives a warning.) Names longer than 32 characters are an
 error (C<entlong>), not truncated as C<archive_> does.
 
 =head2 next_component($prev) (alias next_component_info)
@@ -1017,6 +1035,7 @@ True if a component has this name.
 =head2 replace_component($name, $data, %attr)
 
 Replace the component in place, or add it at the end (key C<r>).
+Refused (C<dupname>) if more than one component has the name.
 
 =head2 append_component($name, $data, %attr)
 
@@ -1055,10 +1074,11 @@ as a binary component extracted earlier) is added with its exact bit
 count and 9th bits. With C<bits>, the file is taken as raw dense9 data of
 that bit count, and must be exactly C<9 * ceil(bits / 72)> octets.
 
-=head2 extract_component($name, [$dest], force => 1, transfer => 1)
+=head2 extract_component($name_or_component, [$dest], force => 1, transfer => 1)
 
 Write a component to a file (see L</DESCRIPTION> for permissions and
-times). An existing file is replaced only with C<force>. A component
+times). Given a component object (from C<list_components>), that
+component is written, even if an earlier one has the same name. An existing file is replaced only with C<force>. A component
 that is not text (9th bits set, or a bit count that is not a whole
 number of characters) is written in dense9 form, as raw octets (whose
 SHA-256 is C<sha256 -dense9> of the segment on Multics) or, with
@@ -1092,7 +1112,7 @@ ignored with a warning, and not written back.
 
 Also available as C<$Archive::Multics::error> and
 C<$Archive::Multics::error_code>. Codes: C<not_archive>,
-C<archive_fmt_err>, C<no_component>, C<namedup>, C<entlong>,
+C<archive_fmt_err>, C<no_component>, C<namedup>, C<dupname>, C<entlong>,
 C<bad_name>, C<not_text>, C<ninth_bit>, C<bad_transfer>, C<bad_data>,
 C<io>.
 

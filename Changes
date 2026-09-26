@@ -31,6 +31,13 @@ Revision history for Archive-Multics
         bits rather than effective access (which is always writable for
         root). A component extracted and put back unchanged keeps its
         mode and "modified" date; only "updated" changes.
+      - Duplicate component names (joined or crafted archives): reading
+        one warns; x extracts each copy in turn (previously the first
+        copy's data every time, so later copies could not be extracted);
+        xd and xdf delete only components whose file survives, so a copy
+        is never lost, and repeated they take the copies out one at a
+        time; r and u refuse a name that occurs more than once. New error
+        code dupname.
       - Security hardening: a component name containing a control
         character is never used as a file name; archive text in error
         messages is shown with unprintable characters escaped; dense9

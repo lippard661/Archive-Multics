@@ -695,6 +695,15 @@ sub do_replace {
             return 0;
         }
         $found_something = 1;
+        # Which of several components with this name to replace cannot be
+        # known (the Multics command replaces them all). Refuse.
+        my $n = grep { $_->name eq $cname } $ar->list_components;
+        if ($n > 1) {
+            my $e = "$cname occurs $n times in the archive (xd or xdf takes"
+                . ' the copies out one at a time).';
+            $updated_something = 1 if $k->{update};    # not "contains the latest versions"
+            return $fail->(\$e);
+        }
         my $mtime = $st[9];
         if ($k->{update}) {
             my $old = $ar->get_component($cname);
@@ -729,12 +738,14 @@ sub do_replace {
     };
 
     my %want = map { $_->{name} => $_ } @$req;
+    my %seen;
     for my $comp ($ar->list_components) {
         my $cname = $comp->name;
         if (!@$req) {    # global: replace from the working directory
             # The name comes from the archive: never let it reach (and, for
             # the delete keys, remove) a file outside the working directory.
             next unless Archive::Multics::safe_file_name($cname);
+            next if $seen{$cname}++;    # a duplicate name: tried once (and refused)
             my $src = "$c->{cwd}/$cname";
             next unless -e $src && !-d $src;
             $put->($src, $cname, undef);
@@ -825,7 +836,7 @@ sub do_extract {
     my ($c) = @_;
     my ($ar, $k, $req) = @$c{qw(ar k req)};
     my %want = map { $_->{name} => $_ } @$req;
-    my @remove;
+    my (@extracted, %owner);    # %owner: the component whose data is in each file
 
     for my $comp ($ar->list_components) {
         my $cname = $comp->name;
@@ -857,7 +868,7 @@ sub do_extract {
             # A symbolic link is replaced itself; its target is untouched.
             unless (unlink $dest) { com_err($!, $ddisp); next }
         }
-        unless ($ar->extract_component($cname, $dest, transfer => $opt{transfer})) {
+        unless ($ar->extract_component($comp, $dest, transfer => $opt{transfer})) {
             com_err(\'', $ar->error);
             next;
         }
@@ -867,9 +878,15 @@ sub do_extract {
                 . ($opt{transfer} ? "as a dense9 transfer file (bit count $bc)."
                                   : "in dense9 form, bit count $bc (to put it back: --bits $bc)."));
         }
-        push @remove, $comp if $k->{del};
+        $owner{$dest} = $comp;
+        push @extracted, [ $comp, $dest ];
     }
 
+    # With duplicate component names, a later component can be extracted
+    # over an earlier one's file. Delete from the archive only components
+    # whose file still holds them, so that nothing is lost (the Multics
+    # command deletes them all).
+    my @remove = $k->{del} ? map { $_->[0] } grep { $owner{ $_->[1] } == $_->[0] } @extracted : ();
     if (@remove) {
         $ar->remove_component($_) for @remove;
         write_archive($c) or return;
@@ -1066,6 +1083,19 @@ Replace existing files without asking.
 
 =back
 
+=head2 Duplicate component names
+
+The archive command never makes two components with the same name, but
+an archive can hold them (for example, two archives joined end to end).
+Reading one gives a warning naming each duplicate. B<t> lists every copy,
+B<d> deletes every copy, and B<r> and B<u> refuse to replace a name that
+occurs more than once. The extract keys extract every copy in turn to the
+same file, asking (unless forced) before each overwrites the one before.
+B<xd> and B<xdf> delete from the archive only the components whose file
+survives, so nothing is lost. Each run of B<xdf> takes out the last copy,
+and B<xd>, answering no to each query, the first: rename the file and
+repeat until one is left.
+
 =head1 STAR NAMES
 
 For the table and extract keys, I<archive_path> may be a Multics star
@@ -1185,6 +1215,14 @@ archive has it left-justified.
 
 Updates lock the archive (L<flock(2)>) so concurrent runs cannot
 interleave.
+
+=item *
+
+With duplicate component names (see L</Duplicate component names>),
+B<xd> and B<xdf> do not delete a component whose extracted file was
+overwritten by a later copy (Multics deletes it, losing it), and B<r>
+and B<u> refuse the name (Multics replaces every copy with the same
+file). Reading such an archive gives a warning.
 
 =back
 

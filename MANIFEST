@@ -16,6 +16,7 @@ t/10-command.t
 t/11-sandbox.t
 t/12-names.t
 t/13-dense9.t
+t/14-dupnames.t
 t/data/README
 t/data/bound_secure_hash_.dense9
 t/data/tests.ac_t.txt
