@@ -148,12 +148,10 @@ entry points `$pack` and `$unpack`. (Proposed earlier as
   `decode_base64` takes no new arguments: it recognizes the
   `-dense9 <bitcount>` header and decodes accordingly; without it, it
   decodes as before. Both use `convert_dense9_` for the packing.
-- `secure_hash_` has not yet been changed to use `convert_dense9_`; that
-  is planned. Its dense9 path calls out once per octet (about 200,000
-  calls for a typical archive), the pattern that cost 2.8x in its byte8
-  path before that was removed. Calling `convert_dense9_$pack` per block
-  would share one implementation and probably be faster; measure
-  `sha256 -dense9` against `-byte8` on the same file before and after.
+- `secure_hash_` keeps its own dense9 packing and does not use
+  `convert_dense9_`. Switching it (calling `convert_dense9_$pack` per
+  block instead of calling out once per octet) was considered, but
+  testing found no performance benefit, so it is not planned.
 - `bit_to_hex` remains in `secure_hash_` (as would a `hex_to_bit` to go
   with it); a general-purpose home for them is still an open question.
 - The rule shared by `convert_dense9_`, `secure_hash_` and
