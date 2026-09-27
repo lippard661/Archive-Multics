@@ -322,4 +322,45 @@ my $dir = abs_path(tempdir(CLEANUP => 1));
     chdir $old;
 }
 
+# --- --name-bits: binaries as NAME.BITCOUNT.dense9, and back.
+{
+    my $old = getcwd();
+    my $d = abs_path(tempdir(CLEANUP => 1));
+    chdir $d or die;
+    spew('bsh.archive', $raw);
+    my $A = qq{"$^X" "-I$ROOT/lib" "$ROOT/bin/archive"};
+    my $orig = Archive::Multics->new(file => 'bsh.archive');
+    my $out = qx{$A --name-bits x bsh 2>&1};
+    like $out, qr/sha256\.70200\.dense9 has 9-bit data.*--name-bits/, '--name-bits x: binary named with its bit count';
+    ok -f 'secure_hash_.127080.dense9' && -f 'sha256.70200.dense9', '... both binaries';
+    ok -f 'bound_secure_hash_.bind', '... text keeps its plain name';
+    is slurp('sha256.70200.dense9'), $orig->get_component('sha256')->dense9, '... raw dense9 contents';
+
+    $out = qx{$A --name-bits r bsh sha256.70200.dense9 2>&1};
+    is $out, '', '--name-bits r NAME.BITCOUNT.dense9';
+    my $a = Archive::Multics->new(file => 'bsh.archive');
+    is_deeply [ $a->component_names ], [qw(secure_hash_ sha256 bound_secure_hash_.bind)], '... replaces component NAME';
+    is $a->get_component('sha256')->dense9, $orig->get_component('sha256')->dense9, '... bit for bit';
+    is $a->get_component('sha256')->bit_count, 70200, '... bit count from the name';
+
+    $out = qx{$A --name-bits r bsh 2>&1};
+    is $out, '', 'global --name-bits r: binaries from NAME.BITCOUNT.dense9, text from NAME';
+    $a = Archive::Multics->new(file => 'bsh.archive');
+    is $a->get_component('secure_hash_')->dense9, $orig->get_component('secure_hash_')->dense9, '... bit for bit';
+
+    rename 'sha256.70200.dense9', 'sha256.70236.dense9';
+    $out = qx{$A --name-bits r bsh sha256.70236.dense9 2>&1};
+    like $out, qr/raw dense9 data of bit count 70236 is 8784/, 'a wrong bit count in the name refused';
+    spew('sha256.70200.dense9', slurp('sha256.70236.dense9'));
+    $out = qx{$A --name-bits r bsh 2>&1};
+    like $out, qr/More than one sha256\.BITCOUNT\.dense9 file/, 'global: two such files for a name refused';
+
+    $out = qx{$A r bsh sha256.70200.dense9 2>&1};
+    $a = Archive::Multics->new(file => 'bsh.archive');
+    ok $a->contains_component('sha256.70200.dense9'), 'without --name-bits, the name is taken as it is';
+    like qx{$A --name-bits t bsh 2>&1}, qr/--name-bits is for the x, r, a and u keys/, '--name-bits with t refused';
+    like qx{$A --name-bits -T x bsh 2>&1}, qr/without -T or --bits/, '--name-bits with -T refused';
+    chdir $old;
+}
+
 done_testing;

@@ -3,13 +3,15 @@ package Archive::Multics;
 use strict;
 use warnings;
 
-our $VERSION = '0.05';
+our $VERSION = '0.06';
 
 use Carp qw(croak);
 use Fcntl qw(:mode);
 use File::Basename qw(basename dirname);
 use File::Temp ();
 use MIME::Base64 ();
+use Compress::Raw::Zlib ();
+use IO::Compress::Gzip ();
 use POSIX ();
 use Archive::Multics::Component;
 
@@ -42,6 +44,7 @@ our %MESSAGES = (
     not_text              => 'Bit count is not a multiple of 9; component cannot be represented in text mode.',
     ninth_bit             => 'The archive contains 9-bit data, which the byte8 format cannot represent.',
     bad_transfer          => 'Not a valid dense9 transfer file.',
+    bad_gzip              => 'Not a valid gzip file.',
     bad_data              => 'Component data is not 9-bit characters.',
     bad_date              => 'Invalid date.',
     io                    => 'I/O error.',
@@ -110,6 +113,8 @@ sub read {
 # as detected from the first octets unless 'encoding' was given to new().
 sub read_string {
     my ($self, $buf) = @_;
+    return $self->_read_gzip($buf) if substr($buf, 0, 2) eq "\x1f\x8b" && !$self->{in_gzip};
+    $self->{gzip} = undef unless $self->{in_gzip};
     my ($enc, $transfer, $d9raw) = ('byte8', 0, 0);
     my $force = $self->{force_enc} // '';
     $self->{warnings} = [];
@@ -155,6 +160,7 @@ sub read_string {
 sub as_string {
     my $self = shift;
     my $s = join '', map { $_->_entry } @{ $self->{components} };
+    return $self->_gzip_string($s) if $self->{gzip};
     if ($self->{encoding} eq 'dense9') {
         my $bits = 9 * length $s;
         return $self->_fail(io => "The archive is $bits bits; the limit is " . MAX_BITS . '.')
@@ -165,6 +171,155 @@ sub as_string {
     return $self->_fail(ninth_bit => 'Write it in dense9 instead.') if $s =~ /[^\x00-\xFF]/;
     utf8::downgrade($s);
     return $s;
+}
+
+# ---------------------------------------------------------------------------
+# gzip, as written and read by the Multics gzip and gunzip commands: one
+# member; the payload is the archive as byte8 octets (BYTE8) or packed
+# dense9 (DENSE9). The bit count comes from an "MU" extra subfield (read,
+# never written: some gunzips mishandle an extra field), else from a stored
+# name ending ".BITCOUNT.dense9", else nine bits to the octet.
+
+use constant GZIP_OS_UNIX => 3;
+
+sub is_gzip { $_[0]{gzip} ? 1 : 0 }
+sub gzip_info { $_[0]{gzip} ? { %{ $_[0]{gzip} } } : undef }
+
+# set_gzip(1, name => $entry, derivation => 'auto'|'byte8'|'dense9'), or
+# set_gzip(0). The name is the Multics entry name stored in the file.
+sub set_gzip {
+    my ($self, $on, %o) = @_;
+    unless ($on) { $self->{gzip} = undef; return $self->_ok }
+    my $g = $self->{gzip} //= {};
+    $g->{name} = $o{name} if defined $o{name};
+    my $d = $o{derivation} // $g->{derivation_opt} // 'auto';
+    croak "derivation must be 'auto', 'byte8' or 'dense9'" unless $d =~ /^(?:auto|byte8|dense9)$/;
+    $g->{derivation_opt} = $d;
+    return $self->_ok;
+}
+
+sub _gzip_string {
+    my ($self, $s) = @_;
+    my $g = $self->{gzip};
+    my $d = $g->{derivation_opt} // 'auto';
+    my $ninth = $s =~ /[^\x00-\xFF]/;
+    # The Multics rule: BYTE8 when it loses nothing, DENSE9 otherwise.
+    $d = $ninth ? 'dense9' : 'byte8' if $d eq 'auto';
+    my $bits = 9 * length $s;
+    return $self->_fail(io => "The archive is $bits bits; the limit is " . MAX_BITS . '.')
+        if $bits > MAX_BITS;
+    my ($payload, $name);
+    my $entry = $g->{name} // (defined $self->{path} ? basename($self->{path}) : 'archive');
+    $entry =~ s/\.gz\z//;
+    if ($d eq 'dense9') {
+        $payload = _pack9($s, $bits);
+        $name = "$entry.$bits.dense9";
+    }
+    else {
+        return $self->_fail(ninth_bit => 'Use the dense9 derivation instead.') if $ninth;
+        utf8::downgrade($payload = $s);
+        $name = $entry;
+    }
+    my $out;
+    IO::Compress::Gzip::gzip(\$payload => \$out, Name => $name, Time => $self->{now} // time,
+        OS_Code => GZIP_OS_UNIX, -Level => 9, Minimal => 0)
+        or return $self->_fail(io => "gzip: $IO::Compress::Gzip::GzipError");
+    $g->{derivation} = $d;
+    $g->{stored_name} = $name;
+    return $out;
+}
+
+sub _read_gzip {
+    my ($self, $buf) = @_;
+    my $bad = sub { $self->_fail(bad_gzip => $_[0]) };
+    return $bad->('It is too short.') if length($buf) < 18;
+    my ($cm, $flg, $mtime) = unpack 'x2 C C V', $buf;
+    return $bad->("Compression method $cm is not deflate.") unless $cm == 8;
+    return $bad->('Reserved flag bits are set.') if $flg & 0xE0;
+    my $p = 10;
+    my ($mu, $fname);
+    if ($flg & 4) {                         # FEXTRA
+        return $bad->('The extra field is truncated.') if $p + 2 > length $buf;
+        my $xlen = unpack 'v', substr($buf, $p, 2);
+        $p += 2;
+        return $bad->('The extra field is truncated.') if $p + $xlen > length $buf;
+        my $x = substr($buf, $p, $xlen);
+        $p += $xlen;
+        my $q = 0;
+        while ($q + 4 <= length $x) {       # walk the subfields
+            my ($id, $len) = unpack 'a2 v', substr($x, $q, 4);
+            last if $q + 4 + $len > length $x;
+            if ($id eq 'MU' && $len >= 6 && !$mu) {
+                my ($ver, $der, $bc) = unpack 'C C V', substr($x, $q + 4, 6);
+                return $bad->("The MU subfield has an unknown derivation ($der).") if $der > 1;
+                $mu = { derivation => $der ? 'dense9' : 'byte8', bits => $bc };
+            }
+            $q += 4 + $len;
+        }
+    }
+    for my $f (8, 16) {                     # FNAME, FCOMMENT: NUL-terminated
+        next unless $flg & $f;
+        my $z = index($buf, "\0", $p);
+        return $bad->('The header is truncated.') if $z < 0;
+        $fname = substr($buf, $p, $z - $p) if $f == 8;
+        $p = $z + 1;
+    }
+    $p += 2 if $flg & 2;                    # FHCRC
+    return $bad->('The header is truncated.') if $p > length $buf;
+
+    # Inflate, a slice at a time, stopping past one segment's worth.
+    my ($inf, $st) = Compress::Raw::Zlib::Inflate->new(
+        -WindowBits => -Compress::Raw::Zlib::MAX_WBITS(), -ConsumeInput => 1, -AppendOutput => 1);
+    return $bad->("inflate: $st") unless $inf;
+    my ($in, $out, $end) = (substr($buf, $p), '', 0);
+    while (length $in) {
+        my $slice = substr($in, 0, 4096, '');
+        $st = $inf->inflate($slice, $out);
+        if ($st == Compress::Raw::Zlib::Z_STREAM_END()) { $in = $slice . $in; $end = 1; last }
+        return $bad->("The compressed data is damaged ($st).") if $st != Compress::Raw::Zlib::Z_OK()
+            && $st != Compress::Raw::Zlib::Z_BUF_ERROR();
+        return $bad->('It expands to more than one segment (' . MAX_OCTETS . ' octets).')
+            if length($out) > MAX_OCTETS;
+    }
+    return $bad->('The compressed data is truncated.') unless $end;
+    return $bad->('It expands to more than one segment (' . MAX_OCTETS . ' octets).')
+        if length($out) > MAX_OCTETS;
+    return $bad->('The trailer is truncated.') if length($in) < 8;
+    my ($crc, $isize) = unpack 'V V', substr($in, 0, 8, '');
+    return $bad->('The check value (CRC-32) does not match.')
+        unless $crc == Compress::Raw::Zlib::crc32($out);
+    return $bad->('The length in the trailer does not match.') unless $isize == length($out) % 2**32;
+    return $bad->('It has more than one member, or data after the first.') if $in =~ /[^\0]/;
+    return $bad->('It holds another gzip file; decompress only once.')
+        if substr($out, 0, 2) eq "\x1f\x8b";
+
+    # Where the bit count comes from, in gunzip's order.
+    my ($der, $bits, $src);
+    if ($mu) { ($der, $bits, $src) = ($mu->{derivation}, $mu->{bits}, 'MU subfield') }
+    elsif (defined $fname && $fname =~ /\.([0-9]{1,8})\.dense9\z/) {
+        ($der, $bits, $src) = ('dense9', $1 + 0, 'stored name');
+    }
+    if (defined $der) {
+        my $want = $der eq 'dense9' ? 9 * int(($bits + 71) / 72) : $bits / 9;
+        return $bad->("Its $src gives bit count $bits ($der), which is "
+            . ($der eq 'dense9' ? "$want octets" : 'not a whole number of octets')
+            . '; it holds ' . length($out) . '.')
+            if $want != length($out) || ($der eq 'byte8' && $bits % 9);
+    }
+    my $inner;
+    {
+        local $self->{in_gzip}   = 1;
+        local $self->{force_enc} = $der if defined $der;
+        $inner = $self->read_string($out);
+    }
+    return unless $inner;
+    return $bad->("Its $src gives bit count $bits, but the archive is " . $self->bit_count . ' bits.')
+        if defined $bits && $bits != $self->bit_count;
+    my $entry = $fname;
+    $entry =~ s/\.[0-9]{1,8}\.dense9\z// if defined $entry;
+    $self->{gzip} = { name => $entry, stored_name => $fname, mtime => $mtime,
+                      derivation => $self->{encoding}, bits_from => $src };
+    return $self->_ok;
 }
 
 # The archive's bit count as it would be written: what Multics records for
@@ -911,13 +1066,33 @@ Archive::Multics reads and writes archives in the format used by the
 Multics C<archive> command, as transferred to Unix either in text mode
 ("byte8": one octet per 9-bit Multics character, 9th bit lost) or in
 "dense9" form (every bit kept, 8 characters in 9 octets), raw or as a
-C<-dense9> I<N> transfer file with a base64 body. It follows the MR12.8
+C<-dense9> I<N> transfer file with a base64 body, and gzipped as the
+Multics C<gzip> command writes it (see L</GZIP>). It follows the MR12.8
 C<archive_> subroutine for reading and C<archive> for writing, so an
 archive read and written without changes is byte-for-byte identical, and
 unchanged components keep their original headers.
 
 See F<docs/FORMAT.md> for the format, and L<archive(1)> for the
 command and its deliberate differences from Multics.
+
+=head1 GZIP
+
+A file beginning with the gzip magic number is decompressed and read as
+the Multics C<gunzip> command reads it. Its payload is the archive as
+byte8 octets (BYTE8) or packed dense9 (DENSE9); the bit count comes from
+an C<MU> extra subfield if there is one (version, derivation 0 = BYTE8 or
+1 = DENSE9, 32-bit little-endian bit count; subfields are walked, and a
+data length over six is allowed), else from a stored name ending
+C<.>I<BITCOUNT>C<.dense9>, else nine bits to the octet. A bit count given
+must match both the octet count and the archive's own. Only one member is
+read, a gzip file inside a gzip file is refused, the expanded size is
+limited to one segment, and the stored name is never used as a file name.
+
+Written, an archive is gzipped as the Multics C<gzip> command does it:
+BYTE8 unless the archive holds 9-bit data, DENSE9 otherwise, with the
+stored name I<entry> (BYTE8) or I<entry>C<.>I<BITCOUNT>C<.dense9>
+(DENSE9), no extra field, and operating system code 3 (Unix). An
+archive read from a gzip file is written back as one.
 
 =head1 CONSTRUCTOR
 
@@ -991,6 +1166,14 @@ The form the archive is read in and will be written in (C<byte8> or
 C<dense9>), whether a dense9 archive is written as a transfer file, and
 a way to change both. Writing byte8 fails with C<ninth_bit> if any
 component has 9-bit data.
+
+=head2 is_gzip, gzip_info, set_gzip($on, name => $entry, derivation => $d)
+
+Whether the archive was read from, and will be written as, a gzip file;
+what its header said (C<stored_name>, C<name>, C<mtime>, C<derivation>,
+C<bits_from>); and a way to turn gzip on or off. C<name> is the Multics
+entry name to store; C<derivation> is C<auto> (the default), C<byte8> or
+C<dense9>. See L</GZIP>.
 
 =head2 bit_count
 
@@ -1113,8 +1296,8 @@ ignored with a warning, and not written back.
 Also available as C<$Archive::Multics::error> and
 C<$Archive::Multics::error_code>. Codes: C<not_archive>,
 C<archive_fmt_err>, C<no_component>, C<namedup>, C<dupname>, C<entlong>,
-C<bad_name>, C<not_text>, C<ninth_bit>, C<bad_transfer>, C<bad_data>,
-C<io>.
+C<bad_name>, C<not_text>, C<ninth_bit>, C<bad_transfer>, C<bad_gzip>,
+C<bad_data>, C<io>.
 
 =head1 COMPONENT METHODS
 

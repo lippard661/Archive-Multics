@@ -274,6 +274,55 @@ bears on any future transfer of MSFs:
   `sha256 -dense9` of the segment on Multics.
 - The checked example above as a fixed unit test.
 
+## gzip on Multics (implemented 2026-09-27)
+
+From the gzip/gunzip info segment:
+
+- RFC 1952 gzip, one octet per 9-bit character (byte8-clean), so
+  `encode_base64` carries it with no header, and sha256 of the .gz
+  agrees on both systems.
+- The octet derivation is chosen per file (`-byte8`/`-dense9` force it):
+  BYTE8 if no 9th bit is set and the bit count is a multiple of 9 (so an
+  archive of source is BYTE8); DENSE9 otherwise (a bound archive, an
+  object segment). DENSE9 compresses about seven times worse on text.
+- Bit count: under DENSE9 in FNAME, as `ENTRYNAME.BITCOUNT.dense9`;
+  under BYTE8, FNAME is the entry name and the bit count is 9 × octets.
+  No FEXTRA is written (Apple's gunzip mishandles FEXTRA with FNAME).
+  gunzip looks for the bit count in an `MU` extra subfield, then in
+  FNAME, and otherwise takes 9 × octets. It does not use FNAME to name
+  its output.
+- The `MU` subfield (read by gunzip, not written by gzip), an ordinary
+  RFC 1952 subfield, all little-endian: `'M' 'U'`, data length (2 octets,
+  6), version (1), derivation (0 = BYTE8, 1 = DENSE9), bit count (4
+  octets). Readers accept a data length of 6 or more and use the first
+  six octets, and walk the subfields (offset += 4 + length) rather than
+  assuming MU is first. Example header, 81 bits, name `test.81.dense9`:
+  `1f 8b 08 0c 00 00 00 00 00 ff 0a 00 4d 55 06 00 01 01 51 00 00 00`.
+- MTIME: date-time contents modified (Unix seconds; 0 if unavailable).
+  OS: 255.
+- One member only; input and output must each fit in one segment; gzip
+  input at most 900,000 octets. Do not recompress: a DENSE9 payload that
+  loses its FNAME can only be recovered if it is self-delimiting, as an
+  archive is.
+- Transfer: `gzip X.archive` then `encode_base64 X.archive.gz F.b64`;
+  on Unix, `base64 -d` and `gunzip -N` (which restores the name with the
+  bit count).
+
+Archive::Multics (0.06) reads and writes this format: every key reads
+a gzipped archive (bit count from MU, else the stored name, checked
+against the octet count and the member headers), and a change is written
+back gzipped; `--gzip` makes `NAME.archive.gz`, or with `--export` a
+gzip file; `--import` also takes a gzip file or base64 of one; a name
+`NAME.archive.BITCOUNT.dense9` (from `gunzip -N`) is read as it is but
+not changed. Writing follows the Multics rule and stored name, with no
+extra field and OS code 3 (Unix: the system the file was made on;
+Multics writes 255, as RFC 1952 has no code for it, and the two values
+show which end made a file). Decompression stops at one segment; one
+member only; a gzip inside a gzip is refused; the stored name is never
+a path. `archive --name-bits` uses the same `NAME.BITCOUNT.dense9` name
+for raw binary components: `x` writes them so, and `r`/`a`/`u` take
+the bit count from it.
+
 ## Open questions
 
 - Pad-bit requirement in `$unpack` (zero?).

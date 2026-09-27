@@ -11,13 +11,14 @@ use strict;
 use warnings;
 
 use Archive::Multics;
+use MIME::Base64 ();
 use Cwd qw(getcwd abs_path);
 use Errno qw(ENOENT EACCES EISDIR EEXIST ENOTDIR);
 use Fcntl qw(:flock :mode);
 use File::Basename qw(fileparse);
 use Getopt::Long qw(:config bundling require_order no_ignore_case);
 
-our $VERSION = '0.05';
+our $VERSION = '0.06';
 my $ME = 'archive';
 
 # ---------------------------------------------------------------------------
@@ -75,8 +76,10 @@ GetOptions(
     'B|bit-count'       => \$opt{bitcount},
     'T|transfer'        => \$opt{transfer},
     'bits=s'            => \$opt{bits},
+    'name-bits'         => \$opt{name_bits},
     'import'            => \$opt{import},
     'export'            => \$opt{export},
+    'gzip'              => \$opt{gzip},
     'P|century-pivot=s' => \$opt{pivot},
     'h|help'            => \$opt{help},
     'V|version'         => \$opt{version},
@@ -86,7 +89,7 @@ if ($opt{help}) {
     print <<"EOT";
 Usage: $ME [options] key archive_path {paths}
        $ME --import transfer_file archive_path
-       $ME --export archive_path transfer_file
+       $ME [--gzip] --export archive_path transfer_file
 
 Keys:  t tl tb tlb          table of contents
        a ad adf ca cad cadf append
@@ -106,11 +109,16 @@ Options:
                           files (with their bit count), not raw dense9
       --bits N            r, a, u keys: the one path named is raw dense9 data
                           of bit count N (a binary extracted without -T)
+      --name-bits         x keys: name binary components NAME.BITCOUNT.dense9;
+                          r, a, u keys: such a file is component NAME, raw
+                          dense9 of that bit count
   -B, --bit-count         print the archive's bit count
-      --import            convert a dense9 transfer file (encode_base64 -dense9)
-                          to an archive
+      --import            convert a dense9 transfer file (encode_base64 -dense9),
+                          a gzip file, or base64 of a gzip file to an archive
       --export            convert an archive to a dense9 transfer file, for
                           decode_base64 on Multics
+      --gzip              a new archive is gzipped (NAME.archive.gz); with
+                          --export, write a gzip file for gunzip on Multics
   -h, --help              this message
   -V, --version           version
 EOT
@@ -260,7 +268,7 @@ sub main {
         return;
     }
     my ($dir, $name) = split_path($patharg);
-    $name .= '.archive' unless $name =~ /\.archive$/;
+    $name = archive_name($dir, $name);
 
     sandbox($k, $dir, \@ARGV) if $^O eq 'openbsd';
 
@@ -305,27 +313,47 @@ sub convert {
     }
     my ($in, $out) = @ARGV;
     if ($import) { $out .= '.archive' unless $out =~ /\.archive$/ }
-    else         { $in  .= '.archive' unless $in  =~ /\.archive$/ }
+    else         { my ($d, $n) = split_path($in); $in = $d eq '.' ? archive_name($d, $n) : "$d/" . archive_name($d, $n) }
     my $idisp = display_path(split_path($in));
     my $odisp = display_path(split_path($out));
 
     sandbox_convert($in, $out) if $^O eq 'openbsd';
 
     my $ar = new_archive_object();
-    unless ($ar->read($in)) {
+    my $ok;
+    if ($import && open my $fh, '<:raw', $in) {
+        # Base64 of a gzip file (encode_base64 of a Multics .gz): decode it.
+        my $data = do { local $/; <$fh> } // '';
+        close $fh;
+        if ($data =~ /\A[A-Za-z0-9+\/=\s]+\z/ && $data =~ /\S/) {
+            my $dec = MIME::Base64::decode_base64($data);
+            $data = $dec if substr($dec, 0, 2) eq "\x1f\x8b";
+        }
+        $ok = $ar->read_string($data);
+    }
+    else { $ok = $ar->read($in) }
+    unless ($ok) {
         if ($ar->error_code eq 'io') { com_err(\'', $ar->error) }
         else { com_err(0, "Format error in $idisp (" . $ar->error . ')') }
         return;
     }
     print STDERR "$ME: Warning: $idisp: $_.\n" for $ar->warnings;
     if ($import) {
-        unless ($ar->is_transfer) {
-            com_err(0, "$idisp is not a dense9 transfer file.");
+        unless ($ar->is_transfer || $ar->is_gzip) {
+            com_err(0, "$idisp is not a dense9 transfer file or a gzip file.");
             return;
         }
-        $ar->set_encoding('dense9', transfer => 0);
+        # A raw archive, in the form it was carried in (a gzipped source
+        # archive is byte8; a transfer file or a DENSE9 gzip is dense9).
+        $ar->set_gzip(0);
+        $ar->set_encoding($ar->encoding, transfer => 0);
+    }
+    elsif ($opt{gzip}) {
+        $ar->set_gzip(1, name => (split_path($in))[1],
+            ($opt{dense9} ? (derivation => 'dense9') : $opt{byte8} ? (derivation => 'byte8') : ()));
     }
     else {
+        $ar->set_gzip(0);
         $ar->set_encoding('dense9', transfer => 1);
     }
     if (-d $out && !-l $out) { com_err(EISDIR, $odisp); return }
@@ -335,8 +363,30 @@ sub convert {
     unless ($ar->write($out)) { com_err(\'', $ar->error); return }
     if ($opt{bitcount}) {
         my $bits = $ar->bit_count;
-        info("$ME: $odisp: bit count $bits (" . $bits / 36 . ' words, dense9)');
+        info("$ME: $odisp: bit count $bits (" . $bits / 36 . ' words, ' . form_of($ar) . ')');
     }
+}
+
+# The form of an archive for messages: byte8, dense9, or gzip (BYTE8 or
+# DENSE9).
+sub form_of {
+    my ($ar) = @_;
+    my $g = $ar->gzip_info;
+    return $g ? 'gzip, ' . uc($g->{derivation} // $ar->encoding) : $ar->encoding;
+}
+
+# The file name for an archive_path: the .archive suffix is added (as on
+# Multics) unless the name is a gzipped archive (NAME.archive.gz) or what
+# gunzip -N makes of a DENSE9 one (NAME.archive.BITCOUNT.dense9). Without
+# a suffix, NAME.archive.gz is used if it exists and NAME.archive does
+# not, and --gzip makes a new archive NAME.archive.gz.
+sub archive_name {
+    my ($dir, $name) = @_;
+    return $name if $name =~ /\.archive\.gz$/ || $name =~ /\.archive\.[0-9]+\.dense9$/;
+    $name .= '.archive' unless $name =~ /\.archive$/;
+    my $p = $dir eq '.' ? $name : "$dir/$name";
+    if (!-e $p && !-l $p && ($opt{gzip} || -e "$p.gz")) { $name .= '.gz' }
+    return $name;
 }
 
 sub sandbox_convert {
@@ -461,9 +511,31 @@ sub process {
         com_err(0, "$disp is a dense9 transfer file; convert it with --import first.");
         return;
     }
+    # NAME.archive.BITCOUNT.dense9 (from gunzip -N): the name must agree
+    # with the contents, and a change would make it wrong.
+    if ($name =~ /\.archive\.([0-9]+)\.dense9$/) {
+        if ($exists && $1 != $ar->bit_count) {
+            com_err(0, "$disp is named for bit count $1, but the archive is " . $ar->bit_count . ' bits.');
+            return;
+        }
+        if ($modifies && !$k->{copy}) {
+            (my $plain = $name) =~ s/\.[0-9]+\.dense9$//;
+            com_err(0, "$disp has its bit count in its name; rename it $plain to change it.");
+            return;
+        }
+    }
+    # A new archive named NAME.archive.gz is gzipped; an existing one stays
+    # gzipped (as it was read).
+    if (!$exists && $name =~ /\.gz$/) {
+        (my $entry = $name) =~ s/\.gz$//;
+        $ar->set_gzip(1, name => $entry);
+    }
     # The form written: as read (new archives byte8) unless an option says.
     if    ($opt{dense9}) { $ar->set_encoding('dense9', transfer => 0) }
     elsif ($opt{byte8})  { $ar->set_encoding('byte8') }
+    if ($ar->is_gzip && ($opt{dense9} || $opt{byte8})) {
+        $ar->set_gzip(1, derivation => $opt{dense9} ? 'dense9' : 'byte8');
+    }
 
     if (!$k->{empty} && $exists && !$ar->list_components) {
         com_err(0, "$disp is empty.");
@@ -491,6 +563,10 @@ sub process {
     for my $a (@args) {
         next if $a eq '';
         my ($cdir, $cname) = $by_name ? (undef, $a) : split_path($a);
+        my $nbits;
+        if ($opt{name_bits} && $k->{action} eq 'replace' && $cname =~ /\A(.+)\.([0-9]{1,8})\.dense9\z/) {
+            ($cname, $nbits) = ($1, $2);    # NAME.BITCOUNT.dense9: component NAME
+        }
         if (length $cname > 32) {
             com_err(\'Entry name too long.', $a);
             next;
@@ -505,7 +581,7 @@ sub process {
             com_err(0, "Duplicated request for this component. $cname");
             next;
         }
-        push @req, { name => $cname, dir => $cdir, path => $a, flag => 0, code => 0 };
+        push @req, { name => $cname, dir => $cdir, path => $a, flag => 0, code => 0, bits => $nbits };
     }
 
     if (!$k->{zarg} && !@req) {
@@ -516,6 +592,11 @@ sub process {
 
     if (defined $opt{bits} && ($k->{action} ne 'replace' || @req != 1)) {
         com_err(0, '--bits needs exactly one component path, with the r, a or u keys.');
+        return;
+    }
+    if ($opt{name_bits} && ($opt{transfer} || defined $opt{bits}
+            || ($k->{action} ne 'extract' && $k->{action} ne 'replace'))) {
+        com_err(0, '--name-bits is for the x, r, a and u keys, without -T or --bits.');
         return;
     }
     if ($opt{transfer} && $k->{action} ne 'extract') {
@@ -537,7 +618,7 @@ sub process {
     if ($opt{bitcount} && !$ctx{write_failed} && !$ctx{unwritten} && ($exists || $ar->list_components)) {
         my $bits = $ar->bit_count;
         my $out  = $k->{copy} ? display_path($cwd, $name) : $disp;
-        info("$ME: $out: bit count $bits (" . $bits / 36 . ' words, ' . $ar->encoding . ')');
+        info("$ME: $out: bit count $bits (" . $bits / 36 . ' words, ' . form_of($ar) . ')');
     }
 }
 
@@ -678,8 +759,9 @@ sub do_replace {
 
     # Try to put one source into the archive. Returns 1 if replaced/added.
     my $put = sub {
-        my ($src, $cname, $r) = @_;
+        my ($src, $cname, $r, $gbits) = @_;
         my $sdisp = display_path(split_path($src));
+        my $bits = $opt{bits} // ($r ? $r->{bits} : $gbits);
         my $fail = sub {
             my ($err) = @_;
             if ($r) { $r->{code} = $err; $r->{flag} = $k->{append} ? 2 : 3 }
@@ -716,7 +798,7 @@ sub do_replace {
         open my $fh, '<:raw', $src or return $fail->($!);
         my $contents = do { local $/; <$fh> } // '';
         close $fh;
-        my @sd = $ar->source_data($contents, (defined $opt{bits} ? (bits => $opt{bits}) : ()));
+        my @sd = $ar->source_data($contents, (defined $bits ? (bits => $bits) : ()));
         print STDERR "$ME: Warning: $sdisp: $_.\n" for @{ $ar->{source_warnings} // [] };
         unless (@sd) { my $e = $ar->error; return $fail->(\$e) }
         my ($data, %extra) = @sd;
@@ -739,6 +821,21 @@ sub do_replace {
 
     my %want = map { $_->{name} => $_ } @$req;
     my %seen;
+    # --name-bits, global: sources may be NAME.BITCOUNT.dense9 in the
+    # working directory (only if one such file exists for the name).
+    my $named = {};
+    if ($opt{name_bits} && !@$req && opendir my $dh, $c->{cwd}) {
+        my %n;
+        for my $f (readdir $dh) {
+            push @{ $n{$1} }, [ $f, $2 ] if $f =~ /\A(.+)\.([0-9]{1,8})\.dense9\z/;
+        }
+        closedir $dh;
+        for my $cn (sort keys %n) {
+            if (@{ $n{$cn} } == 1) { $named->{$cn} = $n{$cn}[0]; next }
+            com_err(0, "More than one $cn.BITCOUNT.dense9 file in " . abs_dir($c->{cwd}) . "; $cn not replaced.");
+            $seen{$cn} = 1;
+        }
+    }
     for my $comp ($ar->list_components) {
         my $cname = $comp->name;
         if (!@$req) {    # global: replace from the working directory
@@ -747,8 +844,12 @@ sub do_replace {
             next unless Archive::Multics::safe_file_name($cname);
             next if $seen{$cname}++;    # a duplicate name: tried once (and refused)
             my $src = "$c->{cwd}/$cname";
+            my $gbits;
+            if ($opt{name_bits} && (my $nb = $named->{$cname})) {    # NAME.BITCOUNT.dense9
+                ($src, $gbits) = ("$c->{cwd}/$nb->[0]", $nb->[1]);
+            }
             next unless -e $src && !-d $src;
-            $put->($src, $cname, undef);
+            $put->($src, $cname, undef, $gbits);
             next;
         }
         my $r = $want{$cname} or next;
@@ -777,7 +878,7 @@ sub do_replace {
 
     for my $r (@$req) {
         my $f = $r->{flag};
-        my $sdisp = display_path($r->{dir}, $r->{name});
+        my $sdisp = display_path(split_path($r->{path}));
         if    ($f == 0) { com_err(0, "$r->{name} not found in $c->{disp}") }
         elsif ($f == 2) { com_err($r->{code}, "Could not append $sdisp to $c->{disp}") }
         elsif ($f == 3) {
@@ -849,8 +950,10 @@ sub do_extract {
             next;
         }
         my $ddir = $r ? $r->{dir} : '.';
-        my $dest = $ddir eq '.' ? $cname : "$ddir/$cname";
-        my $ddisp = display_path($ddir, $cname);
+        my $fname = $cname;
+        $fname .= '.' . $comp->bit_count . '.dense9' if $opt{name_bits} && !$comp->is_text;
+        my $dest = $ddir eq '.' ? $fname : "$ddir/$fname";
+        my $ddisp = display_path($ddir, $fname);
 
         unless (-d $ddir) { com_err(ENOENT, display_path(split_path($ddir))); next }
         unless (-w $ddir) { com_err(\'Append permission missing.', abs_dir($ddir)); next }
@@ -875,8 +978,9 @@ sub do_extract {
         if ($binary) {
             my $bc = $comp->bit_count;
             info("$ME: $ddisp has 9-bit data; written "
-                . ($opt{transfer} ? "as a dense9 transfer file (bit count $bc)."
-                                  : "in dense9 form, bit count $bc (to put it back: --bits $bc)."));
+                . ($opt{transfer}  ? "as a dense9 transfer file (bit count $bc)."
+                 : $opt{name_bits} ? "in dense9 form, bit count $bc (to put it back: --name-bits)."
+                                   : "in dense9 form, bit count $bc (to put it back: --bits $bc)."));
         }
         $owner{$dest} = $comp;
         push @extracted, [ $comp, $dest ];
@@ -908,7 +1012,7 @@ B<archive> [B<-S>] [B<-9> | B<-8>] [B<-T>] [B<--bits> I<n>] [B<-B>] [B<-z> I<zon
 
 B<archive> [B<-B>] B<--import> I<transfer_file> I<archive_path>
 
-B<archive> [B<-B>] B<--export> I<archive_path> I<transfer_file>
+B<archive> [B<-B>] [B<--gzip>] B<--export> I<archive_path> I<transfer_file>
 
 B<archive> B<-h> | B<-V>
 
@@ -1139,17 +1243,39 @@ with bit count I<n>. The file must be exactly 9 x ceil(I<n>/72) octets.
 The extract keys print the bit count of each binary component they
 write.
 
+=item B<--name-bits>
+
+With the extract keys, a binary component (one with 9-bit data) is
+written in raw dense9 form as I<name>C<.>I<BITCOUNT>C<.dense9>, the name
+the Multics C<gzip> command stores for DENSE9, so the bit count travels
+with the file; text components keep their names. With the B<r>, B<a>
+and B<u> keys, a file named I<name>C<.>I<BITCOUNT>C<.dense9> is component
+I<name>, raw dense9 data of that bit count, as if given with B<--bits>
+(the file must be exactly 9 x ceil(I<BITCOUNT>/72) octets); with no
+paths, such a file in the working directory is the source for component
+I<name> (if there is only one). Not with B<-T> or B<--bits>. Without this
+option, such names have no special meaning.
+
 =item B<--import> I<transfer_file> I<archive_path>
 
-Convert a dense9 transfer file to an archive in raw dense9 form. The
+Convert a dense9 transfer file, a gzip file, or base64 of a gzip file
+(what C<encode_base64> makes of a Multics C<.gz>) to an archive: raw
+dense9 from a transfer file or a DENSE9 gzip, byte8 from a BYTE8 gzip. The
 C<.archive> suffix is added to I<archive_path> if it is missing; if the
 file exists, you are asked whether to replace it.
 
 =item B<--export> I<archive_path> I<transfer_file>
 
 Convert an archive, in either form, to a dense9 transfer file, ready for
-C<decode_base64> on Multics. If I<transfer_file> exists, you are asked
+C<decode_base64> on Multics. With B<--gzip>, write a gzip file instead,
+ready for C<gunzip> on Multics (after C<base64> here and C<decode_base64>
+there, if it goes as text). If the output file exists, you are asked
 whether to replace it.
+
+=item B<--gzip>
+
+A new archive is gzipped, and named I<name>C<.archive.gz>; with
+B<--export>, the output is a gzip file. See L</GZIPPED ARCHIVES>.
 
 =item B<-B>, B<--bit-count>
 
@@ -1225,6 +1351,31 @@ and B<u> refuse the name (Multics replaces every copy with the same
 file). Reading such an archive gives a warning.
 
 =back
+
+=head1 GZIPPED ARCHIVES
+
+An archive can be gzipped as the Multics C<gzip> command does it, and
+read as its C<gunzip> does: BYTE8 (one octet per character) for an
+archive of text, DENSE9 for one that holds 9-bit data, with the bit
+count, under DENSE9, in the stored name I<entry>C<.>I<BITCOUNT>C<.dense9>
+(or an C<MU> extra subfield, which is read but not written). See
+L<Archive::Multics/GZIP>.
+
+Every key reads a gzipped archive, and a key that changes one writes it
+back gzipped. An I<archive_path> without a suffix names
+I<name>C<.archive>, or I<name>C<.archive.gz> if only that exists (or if
+B<--gzip> is given and neither does). A name ending
+C<.archive.>I<BITCOUNT>C<.dense9>, which is what C<gunzip -N> makes of a
+DENSE9 file, is read as it is, if the bit count agrees with the
+archive's; it cannot be changed under that name, since the name would
+then be wrong. B<-9> and B<-8> choose the derivation when writing.
+
+The Multics transfer is C<gzip> then C<encode_base64> there, and
+B<--import> here (or C<base64 -d> and this command, or C<gunzip -N>).
+The other way, C<archive --gzip --export>, C<base64>, and on Multics
+C<decode_base64> then C<gunzip>. Plain C<gzip> on Unix is fine for an
+archive of text, but a dense9 archive gzipped by it arrives on Multics
+as nine bits to the octet; use B<--gzip>.
 
 =head1 ARCHIVES FROM THE MIT SOURCE SITE
 

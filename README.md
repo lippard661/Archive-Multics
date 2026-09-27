@@ -15,9 +15,9 @@ prints on Multics.
 
 ## OpenBSD installation
 
-The OpenBSD package is `p5-Archive-Multics-0.05.tgz`:
+The OpenBSD package is `p5-Archive-Multics-0.06.tgz`:
 
-    pkg_add ./p5-Archive-Multics-0.05.tgz
+    pkg_add ./p5-Archive-Multics-0.06.tgz
 
 It installs the module, `/usr/local/bin/archive`, and the manual pages
 archive(1) and Archive::Multics(3p). The package is architecture
@@ -81,6 +81,11 @@ From Perl:
   a raw one goes back with `--bits N`, the bit count printed on
   extraction.
   `-B` prints an archive's bit count.
+- Gzipped archives, as the Multics `gzip` and `gunzip` commands write and
+  read them (BYTE8 for text, DENSE9 with the bit count in the stored
+  name), are read by every key and written back gzipped; `--gzip` makes
+  new ones, `--gzip --export` writes a gzip file for Multics, and
+  `--import` takes a gzip file or base64 of one.
 - Archives downloaded from the MIT Multics source site end with Bull's
   copyright notice, appended as a malformed extra component. It is
   recognized, ignored with a warning, and left out of anything written.

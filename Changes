@@ -1,5 +1,23 @@
 Revision history for Archive-Multics
 
+0.06  2026-09-27
+      - gzip, as the Multics gzip and gunzip commands write and read it:
+        every key reads a gzipped archive (bit count from an MU extra
+        subfield or a stored name ENTRY.BITCOUNT.dense9, checked against
+        the archive), and changes are written back gzipped; --gzip makes
+        a new archive NAME.archive.gz, or with --export a gzip file for
+        Multics; --import also takes a gzip file or base64 of one; a name
+        NAME.archive.BITCOUNT.dense9 (from gunzip -N) is read as is.
+        Writing uses the Multics rule (BYTE8 unless there is 9-bit data)
+        and OS code 3. Decompression is limited to one segment.
+      - archive --name-bits: the x keys write binary components as
+        NAME.BITCOUNT.dense9 (the name Multics gzip stores for DENSE9),
+        and r, a and u take such a file as component NAME with that bit
+        count, as if given --bits; with no paths, such files in the
+        working directory are the sources. Off by default.
+      - Archive::Multics::Component has its own POD (perldoc
+        Archive::Multics::Component).
+
 0.05  2026-09-25
       - dense9 archives: every 9 bits kept, 8 characters in 9 octets, as
         written on Multics by encode_base64 -dense9. A raw dense9 archive
