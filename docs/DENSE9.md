@@ -89,6 +89,55 @@ a name, and a name would be untrusted input that must never be used as a
 path. (The earlier RFC 822-style wrapper proposal is superseded by this
 format.)
 
+A `sha256=` field would catch corrupted octets, but not a wrong bit
+count: see "Bit count ambiguity" below. The count needs its own check
+(the archive's own structure, or the last-word test).
+
+## Bit count ambiguity
+
+Dense9 data without its bit count (a raw dense9 file, or a transfer body
+whose header is lost) fixes only the octet count, `9 × ceil(B / 72)`: up
+to 72 bit counts are consistent with the same octets.
+
+**The digest cannot resolve it.** `sha256 -dense9` hashes the packed
+octets, and SHA-256's padding encodes the message length in octets, which
+is the same for every candidate. The whole hash input is identical, so
+every candidate gives the same digest; there is nothing to search.
+Checked: `abcdefgh` plus newline (81 bits, 18 octets) is consistent with
+every count from 80 to 144 (65 counts), and all give `fabcb2c7…`. Even the
+true count, 81, is not the lowest: bit 81 is the last bit of the newline,
+which is zero. How wide the ambiguity is depends on the data.
+
+**The octets narrow it.** If the final 72-bit group ends in k zero bits,
+exactly k + 1 counts are possible, at most 72 (the count must reach the
+last one bit);
+if the group ends in a one bit, the count is exactly `72g`.
+
+**Word-aligned data (an archive) nearly decides it.** B is `72g` or
+`72g − 36`, and the second needs the last 36 bits to be zero. So if, of
+the file's last nine octets, the low four bits of the fifth are nonzero,
+or any of the sixth to ninth is, the word count is even and `B = 72g`.
+Checked on 400 random word-aligned cases: every even-word case resolved,
+and (correctly) no odd one. What is left is an even-word archive whose
+last word is zero (the last component's word padding can make it so);
+there the
+member headers settle it, as Archive::Multics does when it reads a raw
+dense9 archive: the archive's bit count is the sum of its members'.
+
+For a raw dense9 *component* there is no such structure, which is why
+`archive --bits N` requires the count (printed when the component is
+extracted) and a transfer file records it. `--bits` checks the octet
+count and warns about nonzero pad bits, but cannot tell a count that is
+too low by some trailing zero bits.
+
+(Where the hash input really does vary between candidates, SHA-256's
+Merkle–Damgård structure helps: candidates sharing a prefix share the
+chaining state, so hash the common prefix once and finish each candidate
+from a copy of the state. With `secure_hash_` that is `$sha256_init` and
+`$sha256_add` up to the point of divergence, a structure assignment to
+copy `sha256_state`, then `$sha256_final` for each candidate. Not useful
+here, since the inputs are identical.)
+
 ## Multics side: `convert_dense9_`
 
 The dense9 packing is now a Multics subroutine, `convert_dense9_`, with
