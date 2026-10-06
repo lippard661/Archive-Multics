@@ -113,8 +113,9 @@ Options:
                           r, a, u keys: such a file is component NAME, raw
                           dense9 of that bit count
   -B, --bit-count         print the archive's bit count
-      --import            convert encode_base64 output (-dense9 and/or -sha256
-                          lines), a gzip file, or base64 of one to an archive
+      --import            convert encode_base64 output (-dense9 or -byte8,
+                          and/or -sha256 lines), a gzip file, or base64 of
+                          one to an archive
       --export            convert an archive to a transfer file for
                           decode_base64 on Multics (dense9 or byte8, as read,
                           or as -9/-8 says), with its -sha256 digest
@@ -1052,10 +1053,11 @@ C<sha256 -dense9> prints for the segment on Multics.
 Multics writes dense9 as a I<transfer file>, with C<encode_base64
 -dense9>: header lines C<-dense9> I<bit count> and (by default)
 C<-sha256> I<digest>, in either order, then the octets in base64.
-Without C<-dense9>, C<encode_base64> writes only the C<-sha256> line,
-before base64 of byte8 data (an archive of text, or a gzip file). The
-digest is of the octets carried, and must match; an unknown header line
-is an error. B<--import> converts a transfer file to an archive (raw dense9),
+Without C<-dense9>, the header is a C<-sha256> line and/or a C<-byte8>
+line (with no value), before base64 of byte8 data (an archive of text,
+or a gzip file). The digest is of the octets carried, and must match; an
+unknown or repeated header line, or both C<-byte8> and C<-dense9>, is an
+error. B<--import> converts a transfer file to an archive (raw dense9),
 and B<--export> converts an archive back to a transfer file for
 C<decode_base64> on Multics (dense9, or byte8 for a byte8 archive), with
 the bit count computed from its contents and its digest. The table and extract keys also read a transfer file directly
@@ -1265,8 +1267,8 @@ option, such names have no special meaning.
 
 =item B<--import> I<transfer_file> I<archive_path>
 
-Convert a transfer file (C<encode_base64> output, with C<-dense9>
-and/or C<-sha256> header lines), a gzip file, or base64 of a gzip file
+Convert a transfer file (C<encode_base64> output, with C<-dense9> or
+C<-byte8>, and/or C<-sha256> header lines), a gzip file, or base64 of a gzip file
 to an archive: raw dense9 from a dense9 transfer or a DENSE9 gzip, byte8
 from byte8 data or a BYTE8 gzip. The
 C<.archive> suffix is added to I<archive_path> if it is missing; if the

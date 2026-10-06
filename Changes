@@ -1,5 +1,17 @@
 Revision history for Archive-Multics
 
+0.07  2026-10-06
+      - Transfer files may carry a "-sha256 <digest>" line, as
+        encode_base64 now writes by default: with "-dense9 N" (in either
+        order) or alone, before base64 of byte8 data (an archive, or a
+        gzip file), with or without a "-byte8" line. The digest of the
+        octets carried is checked; an unknown or repeated header line,
+        or both -byte8 and -dense9, is an error. --import, t and x
+        read all of these; --export and x -T write "-sha256" after
+        "-dense9". --export of a byte8 archive now writes a byte8
+        transfer ("-sha256" and base64 of its octets, as encode_base64
+        without -dense9) instead of a dense9 one; -9 and -8 choose.
+
 0.06  2026-09-27
       - gzip, as the Multics gzip and gunzip commands write and read it:
         every key reads a gzipped archive (bit count from an MU extra

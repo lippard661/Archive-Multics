@@ -74,7 +74,9 @@ MJiMZkMpmM4K
   before base64 of byte8 data (an archive of text, or a gzip file). The
   digest is SHA-256 of the octets carried: for dense9, the packed octets,
   so it equals `sha256 -dense9` of the segment; for byte8, `sha256
-  -byte8`. Archive::Multics checks it, rejects unknown or repeated header
+  -byte8`. A `-byte8` line (no value) may also appear, alone or with
+  `-sha256`, marking byte8 data; with `-dense9` it is an error.
+  Archive::Multics checks it, rejects unknown or repeated header
   lines, and writes `-sha256` after `-dense9` on `--export` and `x -T`;
   `--export` of a byte8 archive writes `-sha256` and base64 of its octets,
   as `encode_base64` does without `-dense9`. On Multics, `decode_base64`

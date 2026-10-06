@@ -51,6 +51,25 @@ for my $k (qw(d9_sha sha_d9 d9)) {
     ok $a->is_gzip && $a->is_transfer, '... gzip inside the transfer';
 }
 
+# "-byte8" on a line by itself, with or without "-sha256", in either order.
+{
+    my $d = sha256_hex($b8);
+    for my $hdr ("-byte8\n-sha256 $d\n", "-sha256 $d\n-byte8\n", "-byte8\n") {
+        my $a = Archive::Multics->new;
+        (my $name = $hdr) =~ s/ [0-9a-f]{64}//; $name =~ s/\n/ /g;
+        ok $a->read_string($hdr . b64($b8)), "byte8 transfer: $name" or diag $a->error;
+        is_deeply [ $a->component_names ], ['alpha'], '... its components';
+        ok $a->is_transfer, '... is a transfer';
+    }
+    my $a = Archive::Multics->new;
+    ok $a->read_string("-byte8\n-sha256 " . sha256_hex($gz) . "\n" . b64($gz)), '-byte8 with a gzip file';
+    ok $a->is_gzip, '... gzip inside';
+    ok !$a->read_string("-byte8\n-dense9 207000\n" . b64($raw)), '-byte8 with -dense9 refused';
+    like $a->error, qr/both "-byte8" and "-dense9"/, '... says so';
+    ok !$a->read_string("-byte8 yes\n" . b64($b8)), '-byte8 with a value refused';
+    ok !$a->read_string("-byte8\n-byte8\n" . b64($b8)), '-byte8 twice refused';
+}
+
 # Damage and malformed headers.
 {
     my $a = Archive::Multics->new;
@@ -99,6 +118,9 @@ for my $k (qw(d9_sha sha_d9)) {
     is $out, '', "--import $k";
     is sha256_hex(slurp("out_$k.archive")), $SHA, '... raw dense9 archive, bit for bit';
 }
+spew('b8_hdr.b64', "-byte8\n-sha256 " . sha256_hex($b8) . "\n" . b64($b8));
+is qx{$CMD --import b8_hdr.b64 out_b8h 2>&1}, '', '--import: -byte8 and -sha256';
+is slurp('out_b8h.archive'), $b8, '... the byte8 archive';
 my $out = qx{$CMD --import b8_sha.b64 out_b8 2>&1};
 is $out, '', '--import: -sha256 alone, byte8 archive';
 is slurp('out_b8.archive'), $b8, '... the byte8 archive';
