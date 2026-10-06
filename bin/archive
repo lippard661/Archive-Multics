@@ -18,7 +18,7 @@ use Fcntl qw(:flock :mode);
 use File::Basename qw(fileparse);
 use Getopt::Long qw(:config bundling require_order no_ignore_case);
 
-our $VERSION = '0.06';
+our $VERSION = '0.07';
 my $ME = 'archive';
 
 # ---------------------------------------------------------------------------
@@ -113,10 +113,11 @@ Options:
                           r, a, u keys: such a file is component NAME, raw
                           dense9 of that bit count
   -B, --bit-count         print the archive's bit count
-      --import            convert a dense9 transfer file (encode_base64 -dense9),
-                          a gzip file, or base64 of a gzip file to an archive
-      --export            convert an archive to a dense9 transfer file, for
-                          decode_base64 on Multics
+      --import            convert encode_base64 output (-dense9 and/or -sha256
+                          lines), a gzip file, or base64 of one to an archive
+      --export            convert an archive to a transfer file for
+                          decode_base64 on Multics (dense9 or byte8, as read,
+                          or as -9/-8 says), with its -sha256 digest
       --gzip              a new archive is gzipped (NAME.archive.gz); with
                           --export, write a gzip file for gunzip on Multics
   -h, --help              this message
@@ -340,7 +341,7 @@ sub convert {
     print STDERR "$ME: Warning: $idisp: $_.\n" for $ar->warnings;
     if ($import) {
         unless ($ar->is_transfer || $ar->is_gzip) {
-            com_err(0, "$idisp is not a dense9 transfer file or a gzip file.");
+            com_err(0, "$idisp is not a base64 transfer file (encode_base64 output) or a gzip file.");
             return;
         }
         # A raw archive, in the form it was carried in (a gzipped source
@@ -353,8 +354,10 @@ sub convert {
             ($opt{dense9} ? (derivation => 'dense9') : $opt{byte8} ? (derivation => 'byte8') : ()));
     }
     else {
+        # As encode_base64 would write it: -dense9 (and -sha256) for a
+        # dense9 archive, -sha256 alone for a byte8 one; -9 or -8 chooses.
         $ar->set_gzip(0);
-        $ar->set_encoding('dense9', transfer => 1);
+        $ar->set_encoding($opt{dense9} ? 'dense9' : $opt{byte8} ? 'byte8' : $ar->encoding, transfer => 1);
     }
     if (-d $out && !-l $out) { com_err(EISDIR, $odisp); return }
     if (-e $out || -l $out) {
@@ -508,7 +511,7 @@ sub process {
     # A transfer file is for moving an archive, not for working on: updates
     # need a real archive, made with --import.
     if ($exists && $modifies && $ar->is_transfer) {
-        com_err(0, "$disp is a dense9 transfer file; convert it with --import first.");
+        com_err(0, "$disp is a base64 transfer file; convert it with --import first.");
         return;
     }
     # NAME.archive.BITCOUNT.dense9 (from gunzip -N): the name must agree
@@ -1047,11 +1050,15 @@ C<sha256 -dense9> prints for the segment on Multics.
 =back
 
 Multics writes dense9 as a I<transfer file>, with C<encode_base64
--dense9>: a first line C<-dense9> I<bit count>, then the octets in
-base64. B<--import> converts a transfer file to an archive (raw dense9),
+-dense9>: header lines C<-dense9> I<bit count> and (by default)
+C<-sha256> I<digest>, in either order, then the octets in base64.
+Without C<-dense9>, C<encode_base64> writes only the C<-sha256> line,
+before base64 of byte8 data (an archive of text, or a gzip file). The
+digest is of the octets carried, and must match; an unknown header line
+is an error. B<--import> converts a transfer file to an archive (raw dense9),
 and B<--export> converts an archive back to a transfer file for
-C<decode_base64> on Multics, with the bit count computed from its
-contents. The table and extract keys also read a transfer file directly
+C<decode_base64> on Multics (dense9, or byte8 for a byte8 archive), with
+the bit count computed from its contents and its digest. The table and extract keys also read a transfer file directly
 (its name gets the C<.archive> suffix like any archive path), but the
 keys that change an archive refuse one: import it first.
 
@@ -1258,16 +1265,20 @@ option, such names have no special meaning.
 
 =item B<--import> I<transfer_file> I<archive_path>
 
-Convert a dense9 transfer file, a gzip file, or base64 of a gzip file
-(what C<encode_base64> makes of a Multics C<.gz>) to an archive: raw
-dense9 from a transfer file or a DENSE9 gzip, byte8 from a BYTE8 gzip. The
+Convert a transfer file (C<encode_base64> output, with C<-dense9>
+and/or C<-sha256> header lines), a gzip file, or base64 of a gzip file
+to an archive: raw dense9 from a dense9 transfer or a DENSE9 gzip, byte8
+from byte8 data or a BYTE8 gzip. The
 C<.archive> suffix is added to I<archive_path> if it is missing; if the
 file exists, you are asked whether to replace it.
 
 =item B<--export> I<archive_path> I<transfer_file>
 
-Convert an archive, in either form, to a dense9 transfer file, ready for
-C<decode_base64> on Multics. With B<--gzip>, write a gzip file instead,
+Convert an archive to a transfer file, ready for C<decode_base64> on
+Multics, as C<encode_base64> would write it: a dense9 archive with
+C<-dense9> and C<-sha256> lines, a byte8 archive with a C<-sha256> line
+and base64 of its octets. B<-9> or B<-8> chooses the form (B<-8> is
+refused for an archive with 9-bit data). With B<--gzip>, write a gzip file instead,
 ready for C<gunzip> on Multics (after C<base64> here and C<decode_base64>
 there, if it goes as text). If the output file exists, you are asked
 whether to replace it.

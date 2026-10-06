@@ -68,7 +68,22 @@ MJiMZkMpmM4K
 - Pad bits after the bit count: Archive::Multics writes zeros and warns
   (does not fail) if it reads nonzero pad bits. (To confirm what `$unpack`
   requires.)
-- byte8 transfers have no header, as before.
+- `-sha256 <digest>` (64 lowercase hex digits): written by default by
+  `encode_base64` since 2026-10, as a second header line after
+  `-dense9 N` (readers accept either order), or as the only header line
+  before base64 of byte8 data (an archive of text, or a gzip file). The
+  digest is SHA-256 of the octets carried: for dense9, the packed octets,
+  so it equals `sha256 -dense9` of the segment; for byte8, `sha256
+  -byte8`. Archive::Multics checks it, rejects unknown or repeated header
+  lines, and writes `-sha256` after `-dense9` on `--export` and `x -T`;
+  `--export` of a byte8 archive writes `-sha256` and base64 of its octets,
+  as `encode_base64` does without `-dense9`. On Multics, `decode_base64`
+  verifies byte8 with one `$sha256_octets` call over the output segment,
+  and dense9 with `$sha256_add` on each buffer before it is unpacked; the
+  digest is the same either way.
+  (It catches damaged octets, not a wrong bit count; see "Bit count
+  ambiguity".)
+- byte8 transfers without `-sha256` have no header, as before.
 
 Archive::Multics:
 

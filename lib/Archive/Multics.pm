@@ -3,7 +3,7 @@ package Archive::Multics;
 use strict;
 use warnings;
 
-our $VERSION = '0.06';
+our $VERSION = '0.07';
 
 use Carp qw(croak);
 use Fcntl qw(:mode);
@@ -12,6 +12,7 @@ use File::Temp ();
 use MIME::Base64 ();
 use Compress::Raw::Zlib ();
 use IO::Compress::Gzip ();
+use Digest::SHA ();
 use POSIX ();
 use Archive::Multics::Component;
 
@@ -43,7 +44,7 @@ our %MESSAGES = (
     bad_name              => 'Invalid component name.',
     not_text              => 'Bit count is not a multiple of 9; component cannot be represented in text mode.',
     ninth_bit             => 'The archive contains 9-bit data, which the byte8 format cannot represent.',
-    bad_transfer          => 'Not a valid dense9 transfer file.',
+    bad_transfer          => 'Not a valid base64 transfer file.',
     bad_gzip              => 'Not a valid gzip file.',
     bad_data              => 'Component data is not 9-bit characters.',
     bad_date              => 'Invalid date.',
@@ -115,11 +116,27 @@ sub read_string {
     my ($self, $buf) = @_;
     return $self->_read_gzip($buf) if substr($buf, 0, 2) eq "\x1f\x8b" && !$self->{in_gzip};
     $self->{gzip} = undef unless $self->{in_gzip};
+    $self->{b64} = 0;
     my ($enc, $transfer, $d9raw) = ('byte8', 0, 0);
     my $force = $self->{force_enc} // '';
     $self->{warnings} = [];
     my $hi;    # dense9: the 9th bits, one octet (0 or 1) per character
-    if ($buf =~ /\A-dense9 /) {
+    if ($buf =~ /\A-sha256 / && $buf !~ /\A-sha256 [^\n]*\n-dense9 /) {
+        # Base64 of byte8 data with its digest (encode_base64 without
+        # -dense9): an archive, or a gzip file. Read what it holds.
+        my ($bits, $oct) = $self->_decode_transfer($buf) or return;
+        return $self->_fail(not_archive => 'It holds base64 of another base64 transfer.')
+            if $oct =~ /\A-(?:dense9|sha256) /;
+        my $ok;
+        {
+            local $self->{force_enc} = $self->{force_enc} // 'byte8' unless substr($oct, 0, 2) eq "\x1f\x8b";
+            $ok = $self->read_string($oct);
+        }
+        return unless $ok;
+        $self->{b64} = 1;
+        return $self->_ok;
+    }
+    if ($buf =~ /\A-(?:dense9|sha256) /) {
         return $self->_fail(not_archive => 'It is a dense9 transfer file.') if $force eq 'byte8';
         my ($bits, $oct) = $self->_decode_transfer($buf) or return;
         return $self->_fail(not_archive => "Bit count $bits is not a whole number of words.")
@@ -170,7 +187,16 @@ sub as_string {
     }
     return $self->_fail(ninth_bit => 'Write it in dense9 instead.') if $s =~ /[^\x00-\xFF]/;
     utf8::downgrade($s);
-    return $s;
+    return $self->{transfer} ? _encode_transfer_byte8($s) : $s;
+}
+
+# A byte8 transfer, as encode_base64 writes it without -dense9: the
+# SHA-256 of the octets (sha256 -byte8 of the segment), then base64.
+sub _encode_transfer_byte8 {
+    my ($oct) = @_;
+    my $b64 = MIME::Base64::encode_base64($oct, '');
+    $b64 =~ s/(.{1,${\ TRANSFER_WIDTH}})/$1\n/g;
+    return '-sha256 ' . Digest::SHA::sha256_hex($oct) . "\n$b64";
 }
 
 # ---------------------------------------------------------------------------
@@ -332,14 +358,14 @@ sub bit_count {
 }
 
 sub encoding { $_[0]{encoding} }
-sub is_transfer { $_[0]{encoding} eq 'dense9' && $_[0]{transfer} ? 1 : 0 }
+sub is_transfer { $_[0]{transfer} || $_[0]{b64} ? 1 : 0 }
 
 # set_encoding('byte8') or set_encoding('dense9', transfer => 0|1).
 sub set_encoding {
     my ($self, $enc, %o) = @_;
     croak "encoding must be 'byte8' or 'dense9'" unless $enc =~ /^(?:byte8|dense9)$/;
     $self->{encoding} = $enc;
-    $self->{transfer} = $o{transfer} // 0 if $enc eq 'dense9';
+    $self->{transfer} = $o{transfer} // 0;
     return 1;
 }
 
@@ -400,33 +426,82 @@ sub _encode_transfer {
     my ($oct, $bits) = @_;
     my $b64 = MIME::Base64::encode_base64($oct, '');
     $b64 =~ s/(.{1,${\ TRANSFER_WIDTH}})/$1\n/g;
-    return "-dense9 $bits\n$b64";
+    # As encode_base64 -dense9 writes it: the bit count, then the SHA-256
+    # of the octets (which is sha256 -dense9 of the segment).
+    return "-dense9 $bits\n-sha256 " . Digest::SHA::sha256_hex($oct) . "\n$b64";
+}
+
+# The header lines of a base64 transfer, as encode_base64 writes them:
+# "-dense9 <bit count>" and/or "-sha256 <64 hex digits>", one per line, in
+# either order. Returns (\%h, $offset of the body), () if the data does not
+# begin with one, or undef with an error if the header block is malformed.
+sub _transfer_headers {
+    my ($self, $buf) = @_;
+    return () unless $buf =~ /\A-(?:dense9 [0-9]{1,8}|sha256 [0-9A-Fa-f]{64})\r?\n/;
+    my (%h, $cr);
+    pos($buf) = 0;
+    while ($buf =~ /\G-([a-z0-9]+) ([^\r\n]*?)(\r?)\n/gc) {
+        my ($k, $v) = ($1, $2);
+        $cr ||= $3;
+        return $self->_fail(bad_transfer => "The header line \"-$k\" appears twice.") if exists $h{$k};
+        if    ($k eq 'dense9') {
+            return $self->_fail(bad_transfer => 'The "-dense9" line must give a bit count.')
+                unless $v =~ /\A[0-9]{1,8}\z/;
+            $h{dense9} = $v + 0;
+        }
+        elsif ($k eq 'sha256') {
+            return $self->_fail(bad_transfer => 'The "-sha256" line must give 64 hexadecimal digits.')
+                unless $v =~ /\A[0-9A-Fa-f]{64}\z/;
+            $h{sha256} = lc $v;
+        }
+        else { return $self->_fail(bad_transfer => 'Unknown header line "-' . _printable($k) . '".') }
+    }
+    my $off = pos($buf) // 0;
+    return $self->_fail(bad_transfer => 'Unknown header line "' . _printable(substr($buf, $off, 20)) . '".')
+        if substr($buf, $off, 1) eq '-';
+    $self->_warn('the header lines end in CR LF; decode_base64 on Multics requires LF') if $cr;
+    return (\%h, $off);
 }
 
 # Parse a transfer file ("-dense9 N", LF, base64): returns (N, octets), or
 # an empty list with an error. The octet count must be exactly
 # 9 * ceil(N / 72), as decode_base64 requires, so a truncated transfer is
 # caught.
+# Returns (N, octets) for a dense9 transfer, (undef, octets) for one with
+# only a "-sha256" line (byte8 data: an archive, or a gzip file), or an
+# empty list with an error. With "-dense9", the octet count must be exactly
+# 9 * ceil(N / 72), as decode_base64 requires, so a truncated transfer is
+# caught; with "-sha256", the octets must have that digest.
 sub _decode_transfer {
     my ($self, $buf) = @_;
-    $buf =~ /\A-dense9 ([0-9]{1,8})(\r?)\n/
-        or return $self->_fail(bad_transfer => 'The first line must be "-dense9 <bit count>".');
-    my ($bits, $cr) = ($1 + 0, $2);
-    $self->_warn('the "-dense9" line ends in CR LF; decode_base64 on Multics requires LF') if $cr;
+    my ($h, $off) = $self->_transfer_headers($buf);
+    return unless $h;
+    my $bits = $h->{dense9};
     return $self->_fail(bad_transfer => "Bit count $bits is more than one segment (" . MAX_BITS . ').')
-        if $bits > MAX_BITS;
-    my $body = substr $buf, $+[0];
+        if defined $bits && $bits > MAX_BITS;
+    my $body = substr $buf, $off;
     $body =~ s/\s+//g;
     return $self->_fail(bad_transfer => 'The body contains characters that are not base64.')
         if $body =~ m{[^A-Za-z0-9+/=]};
-    my $want = 9 * int(($bits + 71) / 72);
-    return $self->_fail(bad_transfer => 'Its body holds ' . int(length($body) * 3 / 4)
-        . " octets; a bit count of $bits needs $want (truncated or damaged?).")
-        unless length($body) == $want / 3 * 4;
-    my $oct = MIME::Base64::decode_base64($body);
-    return $self->_fail(bad_transfer => 'It holds ' . length($oct)
-        . " octets; a bit count of $bits needs $want (truncated or damaged?).")
-        unless length($oct) == $want;
+    my $oct;
+    if (defined $bits) {
+        my $want = 9 * int(($bits + 71) / 72);
+        return $self->_fail(bad_transfer => 'Its body holds ' . int(length($body) * 3 / 4)
+            . " octets; a bit count of $bits needs $want (truncated or damaged?).")
+            unless length($body) == $want / 3 * 4;
+        $oct = MIME::Base64::decode_base64($body);
+        return $self->_fail(bad_transfer => 'It holds ' . length($oct)
+            . " octets; a bit count of $bits needs $want (truncated or damaged?).")
+            unless length($oct) == $want;
+    }
+    else {
+        return $self->_fail(bad_transfer => 'The body is more than one segment.')
+            if length($body) > 4 * int((MAX_OCTETS + 2) / 3);
+        $oct = MIME::Base64::decode_base64($body);
+    }
+    return $self->_fail(bad_transfer => 'The SHA-256 of the data does not match its "-sha256" line'
+        . ' (damaged in transfer?).')
+        if defined $h->{sha256} && Digest::SHA::sha256_hex($oct) ne $h->{sha256};
     return ($bits, $oct);
 }
 
@@ -456,7 +531,7 @@ sub source_data {
         my $want = 9 * int(($bits + 71) / 72);
         return $self->_fail(bad_data => 'The file is a dense9 transfer file, which'
             . ' records its own bit count; give it without a bit count.')
-            if $contents =~ /\A-dense9 /;
+            if $self->_transfer_contents_is($contents);
         return $self->_fail(bad_data => 'The file is ' . length($contents)
             . " octets; raw dense9 data of bit count $bits is $want.")
             unless length($contents) == $want;
@@ -476,9 +551,16 @@ sub source_data {
 # transfer (with an error).
 # Only a first line of exactly "-dense9 <digits>" makes it one; a text file
 # that merely starts with "-dense9 " is text.
+sub _transfer_contents_is {
+    my ($self, $data) = @_;
+    return $data =~ /\A(?:-sha256 [0-9A-Fa-f]{64}\r?\n)?-dense9 [0-9]{1,8}\r?\n/ ? 1 : 0;
+}
+
 sub _transfer_contents {
     my ($self, $data) = @_;
-    return () unless $data =~ /\A-dense9 [0-9]{1,8}\r?\n/;
+    # A component transfer has a "-dense9" line (and perhaps "-sha256");
+    # base64 with only a digest is stored as it is, not decoded.
+    return () unless $self->_transfer_contents_is($data);
     local $self->{warnings} = [];
     my ($bits, $oct) = $self->_decode_transfer($data) or return undef;
     $self->_check_pad($oct, $bits);
@@ -1066,7 +1148,9 @@ Archive::Multics reads and writes archives in the format used by the
 Multics C<archive> command, as transferred to Unix either in text mode
 ("byte8": one octet per 9-bit Multics character, 9th bit lost) or in
 "dense9" form (every bit kept, 8 characters in 9 octets), raw or as a
-C<-dense9> I<N> transfer file with a base64 body, and gzipped as the
+transfer file (C<encode_base64> output: header lines C<-dense9> I<N>
+and/or C<-sha256> I<digest>, in either order, then base64; the digest,
+of the octets carried, is checked), and gzipped as the
 Multics C<gzip> command writes it (see L</GZIP>). It follows the MR12.8
 C<archive_> subroutine for reading and C<archive> for writing, so an
 archive read and written without changes is byte-for-byte identical, and
@@ -1163,8 +1247,9 @@ Returns false on error.
 =head2 encoding, is_transfer, set_encoding($enc, transfer => $bool)
 
 The form the archive is read in and will be written in (C<byte8> or
-C<dense9>), whether a dense9 archive is written as a transfer file, and
-a way to change both. Writing byte8 fails with C<ninth_bit> if any
+C<dense9>), whether it is written as a transfer file (dense9: C<-dense9>
+and C<-sha256> lines; byte8: a C<-sha256> line; then base64), and a way
+to change both. Writing byte8 fails with C<ninth_bit> if any
 component has 9-bit data.
 
 =head2 is_gzip, gzip_info, set_gzip($on, name => $entry, derivation => $d)

@@ -48,7 +48,8 @@ is $ar->as_string, $raw, 'unchanged archive written back identically (raw)';
 # --- Transfer form.
 $ar->set_encoding('dense9', transfer => 1);
 my $tr = $ar->as_string;
-like $tr, qr/\A-dense9 207000\n[A-Za-z0-9+\/]{64}\n/, 'transfer file: header and 64-column body';
+like $tr, qr/\A-dense9 207000\n-sha256 7304884dc07cd06097420f2b5204d39b34b7545e09eea6765e89587a1d1c3252\n[A-Za-z0-9+\/]{64}\n/,
+    'transfer file: -dense9 and -sha256 lines (sha256 -dense9 of the archive), 64-column body';
 is 9 * int((207000 + 71) / 72), length($raw), 'octet count is 9 * ceil(bits / 72)';
 my $t2 = Archive::Multics->new;
 ok $t2->read_string($tr), 'transfer file read' or diag $t2->error;
@@ -173,7 +174,7 @@ my $dir = abs_path(tempdir(CLEANUP => 1));
     $out = qx{"$^X" "-I$ROOT/lib" "$ROOT/bin/archive" --import bsh.b64 back 2>&1};
     is slurp("back.archive"), $raw, 'command: --import gives the raw archive back, identical';
     $out = qx{"$^X" "-I$ROOT/lib" "$ROOT/bin/archive" --import bsh.archive back 2>&1 </dev/null};
-    like $out, qr/not a dense9 transfer file/, 'command: --import of a raw archive refused';
+    like $out, qr/not a base64 transfer file/, 'command: --import of a raw archive refused';
     chdir "x"; $out = qx{"$^X" "-I$ROOT/lib" "$ROOT/bin/archive" -T xf ../bsh sha256 2>&1};
     like $out, qr/written as a dense9 transfer file/, 'command: -T x writes a transfer file';
     like slurp("sha256"), qr/\A-dense9 70200\n/, '... with its bit count';
