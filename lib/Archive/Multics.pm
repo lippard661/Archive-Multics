@@ -584,11 +584,30 @@ sub _transfer_contents {
 
 # Write atomically: build a temp file in the target directory and rename it
 # over the original, keeping the original's permissions.
+# The file a path names, following symbolic links textually (readlink,
+# not realpath, so that it needs nothing above the directories involved,
+# which matters under unveil(2)). Up to 32 links; a dangling link gives
+# the path it points to. Returns the path itself if it is not a link.
+sub resolve_link {
+    my ($path) = @_;
+    for (1 .. 32) {
+        return $path unless -l $path;
+        my $t = readlink $path;
+        return $path unless defined $t;
+        $path = $t =~ m{^/} ? $t : dirname($path) . "/$t";
+    }
+    return $path;
+}
+
 sub write {
     my ($self, $path) = @_;
     $path //= $self->{path} // croak "no path given";
     my $out = $self->as_string;
     return unless defined $out;
+    my $given = $path;
+    # Through a symbolic link, the file it names is updated (as Multics
+    # updates the segment a link names); the link is left alone.
+    $path = resolve_link($path);
     my $dir = dirname($path);
     my $mode;
     if (my @st = stat $path) { $mode = S_IMODE($st[2]) }
@@ -603,7 +622,7 @@ sub write {
         unlink $tmp->filename;
         return $self->_fail(io => "$path: $err");
     }
-    $self->{path} = $path;
+    $self->{path} = $given;
     return $self->_ok;
 }
 
@@ -1294,6 +1313,14 @@ the length does not fit C<bits>.
 
 C<write> replaces the file atomically (temporary file and rename),
 keeping its permissions. Hard links to the old file are not updated.
+Given a symbolic link, it replaces the file the link names (as Multics
+updates the segment a link names), and the link is kept.
+
+=head2 Archive::Multics::resolve_link($path)
+
+The file a path names after following symbolic links, worked out with
+C<readlink> rather than C<realpath>, so that it looks at nothing above
+the directories involved (which matters under L<unveil(2)>).
 
 =head2 list_components, component_names
 

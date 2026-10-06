@@ -25,6 +25,13 @@ Revision history for Archive-Multics
         then showed a relative name) and counting as an unveil violation
         in process accounting (lastcomm -U). They are now found before
         unveil.
+      - An archive named through a symbolic link is updated where it is,
+        and the link kept; previously the link was replaced by an updated
+        copy and the archive it named was left unchanged. On OpenBSD the
+        directories of symbolic-link targets (the archive, star-name
+        matches, global replace and update sources in the working
+        directory, and --import input) are now unveiled, so they are read
+        rather than refused. New function Archive::Multics::resolve_link.
 
 0.06  2026-09-27
       - gzip, as the Multics gzip and gunzip commands write and read it:

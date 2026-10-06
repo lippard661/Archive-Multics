@@ -80,4 +80,26 @@ $s = sandbox_for($d, '--import', "$out/x.b64", "$src/y");
 is $s->{unveil}{$out}, 'r', '--import: transfer file directory read-only';
 is $s->{unveil}{$src}, 'rwc', '--import: archive directory writable';
 
+# Symbolic links: the archive, global sources, an --import input.
+{
+    my $real = abs_path(tempdir(CLEANUP => 1));
+    my $work = abs_path(tempdir(CLEANUP => 1));
+    my $other = abs_path(tempdir(CLEANUP => 1));
+    open my $f, '>', "$real/l.archive" or die; close $f;
+    symlink "$real/l.archive", "$work/l.archive" or die;
+    open $f, '>', "$other/g" or die; close $f;
+    symlink "$other/g", "$work/g" or die;
+    my $s = sandbox_for($work, 'r', 'l', "$src/f");
+    is $s->{unveil}{$real}, 'rwc', 'archive through a symlink: its real directory writable';
+    $s = sandbox_for($work, 't', 'l');
+    is $s->{unveil}{$real}, 'r', '... read-only for t';
+    $s = sandbox_for($work, 't', 'l*');
+    is $s->{unveil}{$real}, 'r', '... and for a star name matching it';
+    $s = sandbox_for($work, 'r', 'l');
+    is $s->{unveil}{$other}, 'r', 'global r: a symlinked source\'s directory readable';
+    symlink "$real/l.archive", "$work/in.b64" or die;
+    $s = sandbox_for($work, '--import', 'in.b64', 'out');
+    is $s->{unveil}{$real}, 'r', '--import: a symlinked input\'s directory readable';
+}
+
 done_testing;

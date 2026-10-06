@@ -268,4 +268,22 @@ SKIP: {
     is $e, "archive: Incorrect access on entry. $s/p.archive\n", 'unreadable archive is not treated as missing';
 }
 
+# Updating an archive through a symbolic link updates the file it names;
+# the link stays a link.
+{
+    my $real = tempdir(CLEANUP => 1);
+    my $work = tempdir(CLEANUP => 1);
+    my $a = Archive::Multics->new;
+    $a->append_component(one => "1\n") or die;
+    $a->write("$real/l.archive") or die $a->error;
+    symlink "$real/l.archive", "$work/l.archive" or die;
+    spew("$work/two", "2\n");
+    my $old = getcwd(); chdir $work or die;
+    qx{"$^X" "-I$ROOT/lib" "$ROOT/bin/archive" r l two 2>&1};
+    chdir $old;
+    ok -l "$work/l.archive", 'r through a symlink: the link is still a link';
+    is_deeply [ Archive::Multics->new(file => "$real/l.archive")->component_names ], [qw(one two)],
+        '... and the file it names was updated';
+}
+
 done_testing;

@@ -296,7 +296,7 @@ sub main {
     my ($dir, $name) = split_path($patharg);
     $name = archive_name($dir, $name);
 
-    sandbox($k, $dir, \@ARGV) if $^O eq 'openbsd';
+    sandbox($k, $dir, \@ARGV, $name) if $^O eq 'openbsd';
 
     if (has_stars($name)) {
         unless ($k->{star}) {
@@ -432,6 +432,7 @@ sub sandbox_convert {
     $add->($_, 'r') for grep { !ref && -d } @INC;
     $add->($_, 'r') for grep { -e } qw(/usr/share/zoneinfo /etc/localtime);
     $add->((split_path($in))[0], 'r');
+    $add->((split_path(Archive::Multics::resolve_link($in)))[0], 'r') if -l $in;
     $add->((split_path($out))[0], 'rwc');
     remember_dirs(map { (split_path($_))[0] } $in, $out);    # before the first unveil
     $UNVEILED = 1;
@@ -445,7 +446,7 @@ sub sandbox_convert {
 }
 
 sub sandbox {
-    my ($k, $dir, $args) = @_;
+    my ($k, $dir, $args, $name) = @_;
     require OpenBSD::Pledge;
     require OpenBSD::Unveil;
 
@@ -467,6 +468,20 @@ sub sandbox {
 
     # The archive's directory: rewritten by rename unless a copy is made.
     $add->($dir, ($writes && !$k->{copy}) ? 'rwc' : 'r');
+    # An archive reached through a symbolic link is read, and updated, where
+    # it is; with a star name, any link among the matches is read.
+    my @arch = ($name);
+    if (has_stars($name)) {
+        my $re = star_regex($name);
+        @arch = ();
+        if (opendir my $dh, $dir) { @arch = grep { $_ =~ $re } readdir $dh; closedir $dh }
+    }
+    for my $n (@arch) {
+        my $p = $dir eq '.' ? $n : "$dir/$n";
+        next unless -l $p;
+        $add->((split_path(Archive::Multics::resolve_link($p)))[0],
+            ($writes && !$k->{copy}) ? 'rwc' : 'r');
+    }
 
     # The working directory: global replace/update reads (and d deletes)
     # sources there, copies are written there, extraction defaults there.
@@ -475,6 +490,16 @@ sub sandbox {
         || ($act eq 'replace' && $k->{del} && !@named);
     $add->(getcwd(), $cwd_how);
 
+    # Global replace or update: sources in the working directory may be
+    # symbolic links to files elsewhere, which are read where they are.
+    if ($act eq 'replace' && !@named && opendir my $dh, '.') {
+        for my $f (readdir $dh) {
+            next unless -l $f;
+            $add->((split_path(Archive::Multics::resolve_link($f)))[0], 'r');
+        }
+        closedir $dh;
+    }
+
     # Source and destination directories named by the paths.
     if ($act eq 'replace' || $act eq 'extract') {
         for my $p (@named) {
@@ -482,8 +507,7 @@ sub sandbox {
             if ($files) { $add->($d, 'rwc'); next }
             $add->($d, $k->{del} ? 'rc' : 'r');
             if (-l $p) {    # read through a symbolic link
-                my $t = abs_path($p);
-                $add->((split_path($t))[0], 'r') if defined $t;
+                $add->((split_path(Archive::Multics::resolve_link($p)))[0], 'r');
             }
         }
     }
@@ -1370,7 +1394,9 @@ Extracted files get the component's modification time.
 =item *
 
 B<d> keys remove a symbolic link itself, not its target, and extracting
-onto a symbolic link replaces the link, not the file it points to.
+onto a symbolic link replaces the link, not the file it points to. An
+archive named through a symbolic link is updated where it is, and the
+link is kept, as on Multics.
 
 =item *
 
