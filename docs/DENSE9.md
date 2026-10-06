@@ -78,8 +78,12 @@ MJiMZkMpmM4K
   `-sha256`, marking byte8 data; with `-dense9` it is an error.
   Archive::Multics checks it, rejects unknown or repeated header
   lines, and writes `-sha256` after `-dense9` on `--export` and `x -T`;
-  `--export` of a byte8 archive writes `-sha256` and base64 of its octets,
-  as `encode_base64` does without `-dense9`. On Multics, `decode_base64`
+  `--export` of a byte8 archive writes `-byte8`, `-sha256` and base64 of
+  its octets, as `encode_base64` does (the derivation line comes first;
+  the digest is of the octets encoded, not of the base64 text).
+  `--gzip --export` does the whole Multics pipeline (archive, gzip,
+  `encode_base64`) in one step: on `bound_secure_hash_`, 21,465 octets
+  against 35,128 for a plain dense9 `--export`. On Multics, `decode_base64`
   verifies byte8 with one `$sha256_octets` call over the output segment,
   and dense9 with `$sha256_add` on each buffer before it is unpacked; the
   digest is the same either way.

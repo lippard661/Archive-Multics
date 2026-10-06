@@ -139,6 +139,22 @@ is sha256_hex(slurp('back.archive')), $SHA, '... raw dense9 archive, bit for bit
 $out = qx{$CMD --import bsh.gz back2 2>&1};
 is sha256_hex(slurp('back2.archive')), $SHA, '--import of a gzip file';
 
+# --export --gzip to a name not ending in .gz: the gzip file as
+# encode_base64 carries it ("-byte8", "-sha256" of the gzip octets, base64).
+$out = qx{$CMD --gzip --export bsh bshgz.b64 2>&1};
+is $out, '', '--gzip --export to a .b64 name';
+my $tx = slurp('bshgz.b64');
+my ($hdr_sha) = $tx =~ /\A-byte8\n-sha256 ([0-9a-f]{64})\n/;
+ok $hdr_sha, '... -byte8 then -sha256 lines';
+(my $body = $tx) =~ s/\A(?:-[^\n]*\n)+//;
+my $gzo = MIME::Base64::decode_base64($body);
+is substr($gzo, 0, 2), "\x1f\x8b", '... body is a gzip file';
+is $hdr_sha, sha256_hex($gzo), '... digest is of the gzip octets';
+$out = qx{$CMD --import bshgz.b64 back3 2>&1};
+is sha256_hex(slurp('back3.archive')), $SHA, '... --import gives the archive back, bit for bit';
+qx{$CMD --export bsh plain.b64 2>&1};
+cmp_ok -s 'bshgz.b64', '<', -s 'plain.b64', '... smaller than the plain --export';
+
 # What gunzip -N makes of a DENSE9 file: usable by name, read-only.
 spew('bsh.archive.207000.dense9', $raw);
 $out = qx{$CMD tb bsh.archive.207000.dense9 2>&1};

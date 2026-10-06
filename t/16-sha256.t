@@ -139,7 +139,7 @@ spew('src.archive', $b8);
 $out = qx{$CMD --export src src.b64 2>&1};
 is $out, '', '--export of a byte8 archive';
 my $sb = slurp('src.b64');
-like $sb, qr/\A-sha256 ${\ sha256_hex($b8)}\n[A-Za-z0-9+\/=]+\n/, '... -sha256 line (sha256 -byte8), no -dense9';
+like $sb, qr/\A-byte8\n-sha256 ${\ sha256_hex($b8)}\n[A-Za-z0-9+\/=]+\n/, '... -byte8, then -sha256 (sha256 -byte8)';
 unlike $sb, qr/-dense9/, '... byte8 base64';
 $out = qx{$CMD --import src.b64 src_back 2>&1};
 is slurp('src_back.archive'), $b8, '... and --import gives it back';

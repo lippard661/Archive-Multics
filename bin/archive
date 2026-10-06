@@ -120,7 +120,9 @@ Options:
                           decode_base64 on Multics (dense9 or byte8, as read,
                           or as -9/-8 says), with its -sha256 digest
       --gzip              a new archive is gzipped (NAME.archive.gz); with
-                          --export, write a gzip file for gunzip on Multics
+                          --export, gzip it and write that as base64 (for
+                          decode_base64, then gunzip, on Multics), or as a
+                          gzip file if the output name ends in .gz
   -h, --help              this message
   -V, --version           version
 EOT
@@ -351,7 +353,9 @@ sub convert {
         $ar->set_encoding($ar->encoding, transfer => 0);
     }
     elsif ($opt{gzip}) {
-        $ar->set_gzip(1, name => (split_path($in))[1],
+        # A gzip file (output named *.gz, as in 0.06), or else the gzip
+        # file as a base64 transfer, as encode_base64 would carry it.
+        $ar->set_gzip(1, name => (split_path($in))[1], transfer => ($out !~ /\.gz$/),
             ($opt{dense9} ? (derivation => 'dense9') : $opt{byte8} ? (derivation => 'byte8') : ()));
     }
     else {
@@ -1278,11 +1282,14 @@ file exists, you are asked whether to replace it.
 
 Convert an archive to a transfer file, ready for C<decode_base64> on
 Multics, as C<encode_base64> would write it: a dense9 archive with
-C<-dense9> and C<-sha256> lines, a byte8 archive with a C<-sha256> line
-and base64 of its octets. B<-9> or B<-8> chooses the form (B<-8> is
-refused for an archive with 9-bit data). With B<--gzip>, write a gzip file instead,
-ready for C<gunzip> on Multics (after C<base64> here and C<decode_base64>
-there, if it goes as text). If the output file exists, you are asked
+C<-dense9> and C<-sha256> lines, a byte8 archive with C<-byte8> and
+C<-sha256> lines, then base64 of its octets. B<-9> or B<-8> chooses the
+form (B<-8> is refused for an archive with 9-bit data). With B<--gzip>,
+the archive is gzipped first, as the Multics C<gzip> command does it, and
+the gzip file is written as C<encode_base64> would carry it (C<-byte8>
+and C<-sha256> lines, then base64), for C<decode_base64> then C<gunzip>
+on Multics; if the output file's name ends in C<.gz>, the gzip file
+itself is written instead. If the output file exists, you are asked
 whether to replace it.
 
 =item B<--gzip>

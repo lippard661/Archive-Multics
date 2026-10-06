@@ -9,8 +9,15 @@ Revision history for Archive-Multics
         or both -byte8 and -dense9, is an error. --import, t and x
         read all of these; --export and x -T write "-sha256" after
         "-dense9". --export of a byte8 archive now writes a byte8
-        transfer ("-sha256" and base64 of its octets, as encode_base64
-        without -dense9) instead of a dense9 one; -9 and -8 choose.
+        transfer ("-byte8", "-sha256" and base64 of its octets, as
+        encode_base64 writes it) instead of a dense9 one; -9 and -8
+        choose.
+      - --gzip --export gzips the archive (as Multics gzip does) and
+        writes the gzip file as encode_base64 carries it ("-byte8",
+        "-sha256" of the gzip octets, base64), for decode_base64 then
+        gunzip on Multics: the whole pipeline in one step, and much
+        smaller than a plain --export. An output name ending in .gz
+        still gets the gzip file itself, as in 0.06.
 
 0.06  2026-09-27
       - gzip, as the Multics gzip and gunzip commands write and read it:

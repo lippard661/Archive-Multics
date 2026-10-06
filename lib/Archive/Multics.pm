@@ -194,13 +194,13 @@ sub as_string {
     return $self->{transfer} ? _encode_transfer_byte8($s) : $s;
 }
 
-# A byte8 transfer, as encode_base64 writes it without -dense9: the
-# SHA-256 of the octets (sha256 -byte8 of the segment), then base64.
+# A byte8 transfer, as encode_base64 writes it without -dense9: "-byte8",
+# the SHA-256 of the octets (sha256 -byte8 of the segment), then base64.
 sub _encode_transfer_byte8 {
     my ($oct) = @_;
     my $b64 = MIME::Base64::encode_base64($oct, '');
     $b64 =~ s/(.{1,${\ TRANSFER_WIDTH}})/$1\n/g;
-    return '-sha256 ' . Digest::SHA::sha256_hex($oct) . "\n$b64";
+    return "-byte8\n-sha256 " . Digest::SHA::sha256_hex($oct) . "\n$b64";
 }
 
 # ---------------------------------------------------------------------------
@@ -225,6 +225,7 @@ sub set_gzip {
     my $d = $o{derivation} // $g->{derivation_opt} // 'auto';
     croak "derivation must be 'auto', 'byte8' or 'dense9'" unless $d =~ /^(?:auto|byte8|dense9)$/;
     $g->{derivation_opt} = $d;
+    $g->{transfer} = $o{transfer} ? 1 : 0 if exists $o{transfer};
     return $self->_ok;
 }
 
@@ -256,7 +257,9 @@ sub _gzip_string {
         or return $self->_fail(io => "gzip: $IO::Compress::Gzip::GzipError");
     $g->{derivation} = $d;
     $g->{stored_name} = $name;
-    return $out;
+    # With transfer => 1, the gzip file as encode_base64 would carry it:
+    # "-byte8", "-sha256" (of the gzip octets), then base64.
+    return $g->{transfer} ? _encode_transfer_byte8($out) : $out;
 }
 
 sub _read_gzip {
@@ -1263,13 +1266,15 @@ and C<-sha256> lines; byte8: a C<-sha256> line; then base64), and a way
 to change both. Writing byte8 fails with C<ninth_bit> if any
 component has 9-bit data.
 
-=head2 is_gzip, gzip_info, set_gzip($on, name => $entry, derivation => $d)
+=head2 is_gzip, gzip_info, set_gzip($on, name => $entry, derivation => $d, transfer => $bool)
 
 Whether the archive was read from, and will be written as, a gzip file;
 what its header said (C<stored_name>, C<name>, C<mtime>, C<derivation>,
 C<bits_from>); and a way to turn gzip on or off. C<name> is the Multics
 entry name to store; C<derivation> is C<auto> (the default), C<byte8> or
-C<dense9>. See L</GZIP>.
+C<dense9>; with C<transfer>, the gzip file is written as a base64
+transfer (C<-byte8> and C<-sha256> lines, then base64), as
+C<encode_base64> carries a C<.gz>. See L</GZIP>.
 
 =head2 bit_count
 
