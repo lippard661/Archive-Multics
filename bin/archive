@@ -13,6 +13,7 @@ use warnings;
 use Archive::Multics;
 use MIME::Base64 ();
 use Cwd qw(getcwd abs_path);
+use File::Spec;
 use Errno qw(ENOENT EACCES EISDIR EEXIST ENOTDIR);
 use Fcntl qw(:flock :mode);
 use File::Basename qw(fileparse);
@@ -131,7 +132,11 @@ EOT
 if ($opt{version}) { print "$ME $VERSION (Archive::Multics $Archive::Multics::VERSION)\n"; exit 0 }
 
 my $status = 0;
-my $first_line = 1;    # "archive: " prefix on the first appended/updated line only
+my $first_line = 1;
+# See abs_dir: the working directory and absolute names, taken before unveil.
+my $START_CWD = getcwd();
+my %ABS;
+my $UNVEILED = 0;    # "archive: " prefix on the first appended/updated line only
 
 main();
 exit $status;
@@ -192,10 +197,27 @@ sub query {
 # ---------------------------------------------------------------------------
 # Paths
 
+# Absolute directory names for messages. Perl's abs_path looks up every
+# component from the root, and under unveil(2) the directories above the
+# unveiled ones are hidden: each lookup would fail (and be counted as an
+# unveil violation). So the names needed are resolved before unveil and
+# kept; after it, a name not seen is made absolute textually.
 sub abs_dir {
     my ($d) = @_;
-    my $a = abs_path($d);
-    return defined $a ? $a : $d;
+    return $ABS{$d} if exists $ABS{$d};
+    my $a;
+    if ($UNVEILED) {
+        $a = File::Spec->canonpath(File::Spec->rel2abs($d, $START_CWD));
+        1 while $a =~ s{/(?!\.\.(?:/|\z))[^/]+/\.\.(?=/|\z)}{};    # x/.. -> (nothing)
+        $a = '/' if $a eq '';
+    }
+    else { $a = abs_path($d) }
+    return $ABS{$d} = defined $a ? $a : $d;
+}
+
+# Before unveil: resolve the directories that messages will name.
+sub remember_dirs {
+    abs_dir($_) for '.', $START_CWD, grep { defined && length } @_;
 }
 
 sub display_path {
@@ -411,6 +433,8 @@ sub sandbox_convert {
     $add->($_, 'r') for grep { -e } qw(/usr/share/zoneinfo /etc/localtime);
     $add->((split_path($in))[0], 'r');
     $add->((split_path($out))[0], 'rwc');
+    remember_dirs(map { (split_path($_))[0] } $in, $out);    # before the first unveil
+    $UNVEILED = 1;
     for my $p (sort keys %perm) {
         my %seen;
         my $how = join '', grep { !$seen{$_}++ } split //, $perm{$p};
@@ -464,6 +488,8 @@ sub sandbox {
         }
     }
 
+    remember_dirs($dir, map { (split_path($_))[0] } @named);    # before the first unveil
+    $UNVEILED = 1;
     for my $p (sort keys %perm) {
         my %seen;
         my $how = join '', grep { !$seen{$_}++ } split //, $perm{$p};
@@ -485,7 +511,7 @@ sub process {
     my ($k, $dir, $name, @args) = @_;
     my $path = $dir eq '.' ? $name : "$dir/$name";
     my $disp = display_path($dir, $name);
-    my $cwd  = getcwd();
+    my $cwd  = $START_CWD;    # (getcwd after unveil would look up hidden parents)
     my $modifies = $k->{action} ne 'table' && !($k->{action} eq 'extract' && !$k->{del});
 
     my $ar = new_archive_object();

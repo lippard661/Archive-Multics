@@ -18,6 +18,13 @@ Revision history for Archive-Multics
         gunzip on Multics: the whole pipeline in one step, and much
         smaller than a plain --export. An output name ending in .gz
         still gets the gzip file itself, as in 0.06.
+      - OpenBSD: no path lookups outside the unveiled directories. The
+        absolute directory names in messages were found with abs_path,
+        and the working directory with getcwd, after unveil; each looked
+        up the hidden parent directories, failing quietly (the message
+        then showed a relative name) and counting as an unveil violation
+        in process accounting (lastcomm -U). They are now found before
+        unveil.
 
 0.06  2026-09-27
       - gzip, as the Multics gzip and gunzip commands write and read it:
