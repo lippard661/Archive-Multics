@@ -19,7 +19,7 @@ use Fcntl qw(:flock :mode);
 use File::Basename qw(fileparse);
 use Getopt::Long qw(:config bundling require_order no_ignore_case);
 
-our $VERSION = '0.07';
+our $VERSION = '0.08';
 my $ME = 'archive';
 
 # ---------------------------------------------------------------------------
@@ -500,11 +500,26 @@ sub sandbox {
         closedir $dh;
     }
 
+    # Global extraction into the working directory: a symbolic link there
+    # that a component replaces is reported with its target.
+    if ($files && !@named && opendir my $dh, '.') {
+        for my $f (readdir $dh) {
+            next unless -l $f;
+            $add->(Archive::Multics::resolve_link($f), 'r');
+        }
+        closedir $dh;
+    }
+
     # Source and destination directories named by the paths.
     if ($act eq 'replace' || $act eq 'extract') {
         for my $p (@named) {
             my ($d) = split_path($p);
-            if ($files) { $add->($d, 'rwc'); next }
+            if ($files) {
+                $add->($d, 'rwc');
+                # Extracting onto a symbolic link: the message names its target.
+                $add->(Archive::Multics::resolve_link($p), 'r') if -l $p;
+                next;
+            }
             $add->($d, $k->{del} ? 'rc' : 'r');
             if (-l $p) {    # read through a symbolic link
                 $add->((split_path(Archive::Multics::resolve_link($p)))[0], 'r');
@@ -1023,10 +1038,22 @@ sub do_extract {
         }
         if (-e $dest || -l $dest) {
             if (-d $dest && !-l $dest) { com_err(EISDIR, $ddisp); next }
-            unless ($k->{force}) {
+            if (-l $dest) {
+                # As nd_handler_ does for x and copy, and nd_handler_$force
+                # for xf, xdf and copy -force: a symbolic link is unlinked
+                # and its target is untouched.
+                my $t = Archive::Multics::resolve_link($dest);
+                my $target = -e $t ? ' (Target ' . display_path(split_path($t)) . ' exists.)' : '';
+                if ($k->{force}) {
+                    print STDERR "$ME: Name duplication. Unlinking the old link $ddisp$target\n";
+                }
+                else {
+                    next unless query("Name duplication. Do you want to unlink the old link $ddisp?$target");
+                }
+            }
+            elsif (!$k->{force}) {
                 next unless query("Name duplication. Do you want to delete the old file $ddisp?");
             }
-            # A symbolic link is replaced itself; its target is untouched.
             unless (unlink $dest) { com_err($!, $ddisp); next }
         }
         unless ($ar->extract_component($comp, $dest, transfer => $opt{transfer})) {
@@ -1246,7 +1273,9 @@ Extract, then delete the extracted components from the archive.
 
 =item B<xf>, B<xdf>
 
-Replace existing files without asking.
+Replace existing files without asking. A symbolic link in the way is
+unlinked, with a message naming it and its target; the target is left
+alone.
 
 =back
 
@@ -1393,8 +1422,10 @@ Extracted files get the component's modification time.
 
 =item *
 
-B<d> keys remove a symbolic link itself, not its target, and extracting
-onto a symbolic link replaces the link, not the file it points to. An
+B<d> keys remove a symbolic link itself, not its target. Extracting
+onto a symbolic link unlinks the link, after a query unless the key
+forces it, and leaves the file it points to alone, as Multics does from
+MR12.9 (MCR10177); before that, B<xf> and B<xdf> deleted the target. An
 archive named through a symbolic link is updated where it is, and the
 link is kept, as on Multics.
 
@@ -1402,7 +1433,7 @@ link is kept, as on Multics.
 
 Component names longer than 32 characters are an error rather than
 being truncated, and an unreadable archive is reported rather than
-treated as missing.
+treated as missing. Multics does both from MR12.9 (MCR10177).
 
 =item *
 
@@ -1470,7 +1501,9 @@ directories and the time zone files (read), the archive's directory
 working directory (read, plus write/create for copies, extraction there
 and global C<rd>/C<ud>), and the directories of the named paths: read
 for sources (plus create for C<d> keys, and the target's directory for a
-source that is a symbolic link), read/write/create for extraction.
+source that is a symbolic link), read/write/create for extraction
+(plus read on the target of a symbolic link an extracted file would
+replace, so that the message can say whether it exists).
 
 Promises: C<stdio rpath> for the table keys; C<wpath cpath fattr> added
 for keys that write files; C<flock> added for keys that rewrite the

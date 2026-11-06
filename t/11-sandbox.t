@@ -71,6 +71,13 @@ symlink "$src/f", "$out/lnk" or die;
 $s = sandbox_for($d, 'r', 'x', "$out/lnk");
 is $s->{unveil}{$src}, 'r', 'symlinked source: target directory unveiled';
 
+$s = sandbox_for($d, 'xf', 'x', "$out/lnk");
+is $s->{unveil}{"$src/f"}, 'r', 'xf onto a symlink: its target readable, for the message';
+unlink "$out/lnk";                       # the xf above replaced it
+symlink "$src/f", "$out/lnk" or die;
+$s = sandbox_for($out, 'xf', "$d/x");
+is $s->{unveil}{"$src/f"}, 'r', 'global xf: a symlink\'s target in the working directory readable';
+
 $s = sandbox_for($out, '--export', "$d/x", "$out/x.b64");
 is $s->{pledge}, 'rpath wpath cpath fattr', '--export: write promises, no flock';
 is $s->{unveil}{$d}, 'r', '--export: archive directory read-only';

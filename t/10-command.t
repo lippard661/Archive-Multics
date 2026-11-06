@@ -203,6 +203,21 @@ utime 1790000000, 1790000000, "$d/one", "$d/two";
     ($o, $e) = run($x, undef, 'xf', "$e2/y", 'p2');
     ok !-l "$x/p2", 'xf: link replaced by a file';
     is slurp("$x/target"), "keep me\n", 'xf: link target untouched';
+    is $e, "archive: Name duplication. Unlinking the old link $x/p2 (Target $x/target exists.)\n",
+        'xf: unlinking reported, as nd_handler_$force does';
+
+    # x onto a symbolic link asks to unlink it; a dangling link has no target note.
+    unlink "$x/p2";
+    symlink "target", "$x/p2" or die;
+    ($o, $e) = run($x, "no\n", 'x', "$e2/y", 'p2');
+    like $e, qr/Name duplication\. Do you want to unlink the old link \Q$x\E\/p2\? \(Target \Q$x\E\/target exists\.\)/,
+        'x: asks to unlink a link';
+    ok -l "$x/p2", 'x: link kept when the answer is no';
+    unlink "$x/p2";
+    symlink "nowhere", "$x/p2" or die;
+    ($o, $e) = run($x, undef, 'xf', "$e2/y", 'p2');
+    is $e, "archive: Name duplication. Unlinking the old link $x/p2\n", 'xf: dangling link, no target note';
+    is slurp("$x/p2"), "p two\n", 'xf: extracted over a dangling link';
 
     ($o, $e) = run($x, undef, 'xd', "$e2/y", "$x/sub/p1");
     like $e, qr/Entry not found/, 'xd: missing destination directory';

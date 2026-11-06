@@ -3,7 +3,7 @@ package Archive::Multics;
 use strict;
 use warnings;
 
-our $VERSION = '0.07';
+our $VERSION = '0.08';
 
 use Carp qw(croak);
 use Fcntl qw(:mode);
@@ -1332,7 +1332,8 @@ Returns the first component with that name, or undef with
 C<error_code> C<no_component>. (The archive command never makes two
 components with the same name, but a joined or crafted archive can hold
 them; reading such an archive gives a warning.) Names longer than 32 characters are an
-error (C<entlong>), not truncated as C<archive_> does.
+error (C<entlong>). C<archive_> truncated them before MR12.9 (MCR10177),
+and from MR12.9 returns C<no_component> for them.
 
 =head2 next_component($prev) (alias next_component_info)
 

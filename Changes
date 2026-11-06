@@ -1,5 +1,22 @@
 Revision history for Archive-Multics
 
+0.08  2026-11-06
+      - Extracting onto a symbolic link reports it as Multics does
+        from MR12.9 (MCR10177 bug 5): xf and xdf print "Name
+        duplication. Unlinking the old link PATH (Target PATH
+        exists.)", and x and xd ask "Do you want to unlink the old
+        link PATH?" with the same target note, instead of asking to
+        delete the old file. The link is unlinked and its target left
+        alone, as before. On OpenBSD the link's target is unveiled
+        for reading so that the message can say whether it exists.
+      - Documentation describes Multics after MCR10177 (MR12.9):
+        archive_util_ checks headers as archive_ does, archive_
+        returns no_component for a name over 32 characters and
+        bad_arg for a pointer that does not follow a header, and the
+        Multics command no longer deletes a link's target on xf and
+        xdf, truncates long component names, or treats an unreadable
+        archive as missing.
+
 0.07  2026-10-06
       - Transfer files may carry a "-sha256 <digest>" line, as
         encode_base64 now writes by default: with "-dense9 N" (in either

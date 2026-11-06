@@ -61,9 +61,10 @@ Writer (`archive.pl1`, `rcmp`):
   the same: only new or replaced components get freshly generated
   headers.
 - The `archive` command reads archives with `archive_util_`, not
-  `archive_`, which accepts obsolete `header_begin` and never checks
-  `fence`. The Perl module follows `archive_`, and so does the Perl
-  `archive` command.
+  `archive_`. Before MCR10177 (MR12.9), `archive_util_` accepted the
+  obsolete `header_begin`, never checked `fence`, and did not validate
+  the bit count; it now checks headers as `archive_` does. The Perl
+  module follows `archive_`, and so does the Perl `archive` command.
 
 Notes:
 - The `a` in position 4 is an obsolete append-mode flag; accepted, ignored.
@@ -106,8 +107,10 @@ module mirrors this.
 
 - Names compare as `char (32)`: exact, case-sensitive, trailing blanks
   insignificant.
-- A requested name longer than 32 chars is silently truncated before
-  comparison by `archive_`; the Perl module rejects such names instead.
+- A requested name longer than 32 chars was silently truncated before
+  comparison by `archive_` before MCR10177 (MR12.9), which returns
+  `no_component` for it instead; the Perl module rejects such names
+  (`entlong`).
 - Duplicate names: the first match wins.
 
 ## Error codes (`archive_`)
@@ -117,7 +120,7 @@ module mirrors this.
 | `not_archive` | bit count not word-aligned; nonzero but < 25 words; first header lacks `ident` or `fence` |
 | `archive_fmt_err` | any later header problem; component extends past end; trailing partial data; bad mode/date (info entries) |
 | `no_component` | name not found |
-| `bad_arg` | `next_component*` given a pointer outside the archive, before the first component, or not word-aligned |
+| `bad_arg` | `next_component*` given a pointer outside the archive, before the first component, or not word-aligned; from MCR10177 (MR12.9), also one that does not follow a header (before, `archive_fmt_err`) |
 | `unimplemented_version` | info structure version is not 1 |
 
 ## Component data
