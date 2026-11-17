@@ -3,7 +3,7 @@ package Archive::Multics::Component;
 use strict;
 use warnings;
 
-our $VERSION = '0.08';
+our $VERSION = '0.09';
 
 # A single archive component. Mirrors archive_component_info
 # (archive_component_info.incl.pl1), plus the raw header text so that
@@ -18,8 +18,9 @@ our $VERSION = '0.08';
 #   cdata          all ceil(bit_count / 9) characters, including a last
 #                  partial one; characters are 0-511 in a dense9 archive
 #   mode           4-char mode field, e.g. "r w "
-#   timeup         16-char "updated" field
-#   time           16-char "modified" field
+#   timeup         16-char "updated" field: "mm/dd/yy  hhmm.m" or
+#                  "yyyymmddThhmmssZ"
+#   time           16-char "modified" field, in the same form
 #   archive        the owning Archive::Multics (weak), for time conversion
 
 use Scalar::Util qw(weaken);
@@ -91,10 +92,13 @@ sub _archive {
     return $self->{archive} || croak "component is not attached to an archive";
 }
 
-# Unix times, interpreted in the archive's time zone.
+# Unix times: original-form dates in the archive's time zone, ISO-form in GMT.
 sub time_updated  { my $s = shift; $s->_archive->_parse_date($s->{timeup}) }
 sub time_modified { my $s = shift; $s->_archive->_parse_date($s->{time}) }
 *mtime = \&time_modified;
+
+# 'iso' or 'original': the form of the "updated" date.
+sub date_form { Archive::Multics::_is_iso_date($_[0]{timeup}) ? 'iso' : 'original' }
 
 # Multics clock readings (microseconds since 1901-01-01 00:00 GMT).
 sub multics_time_updated  { Archive::Multics::unix_to_multics_clock($_[0]->time_updated) }

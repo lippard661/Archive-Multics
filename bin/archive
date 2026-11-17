@@ -19,7 +19,7 @@ use Fcntl qw(:flock :mode);
 use File::Basename qw(fileparse);
 use Getopt::Long qw(:config bundling require_order no_ignore_case);
 
-our $VERSION = '0.08';
+our $VERSION = '0.09';
 my $ME = 'archive';
 
 # ---------------------------------------------------------------------------
@@ -82,6 +82,7 @@ GetOptions(
     'export'            => \$opt{export},
     'gzip'              => \$opt{gzip},
     'P|century-pivot=s' => \$opt{pivot},
+    'exl|experimental'  => \$opt{experimental},
     'h|help'            => \$opt{help},
     'V|version'         => \$opt{version},
 ) or usage_exit(2);
@@ -103,6 +104,10 @@ Options:
   -z, --zone TZ           time zone for archive dates (default: local)
   -P, --century-pivot N   2-digit years >= N are 19yy (default 50, RFC 5322;
                           30 is Multics MR12.8; "window" for a rolling window)
+      --exl, --experimental
+                          act as the experimental Multics archive (MCR10207):
+                          a new archive gets yyyymmddThhmmssZ (GMT) dates, and
+                          t and tl show dates as yyyy-mm-dd hhmm.m
   -S, --salvage           read damaged archives as far as possible, with warnings
   -9, --dense9            write the archive in dense9 (9-bit) form
   -8, --byte8             write the archive in byte8 (one octet per character)
@@ -271,7 +276,21 @@ sub new_archive_object {
         salvage  => $opt{salvage},
         (defined $opt{zone}  ? (tz            => $opt{zone})  : ()),
         (defined $opt{pivot} ? (century_pivot => $opt{pivot}) : ()),
+        ($opt{experimental}  ? (date_form     => 'iso')       : ()),
     );
+}
+
+# --experimental t and tl: dates as the experimental Multics archive shows
+# them (TABLE_DATE in its archive.pl1, "^9999yc-^my-^dm ^Hd^99v.9MH"), in the
+# archive's zone: yyyy-mm-dd hhmm.m, the tenth of a minute truncated. Zones
+# are whole minutes, so the tenth is the same in every zone.
+use constant TABLE_DATE => '%Y-%m-%d %H%M';
+
+sub table_date {
+    my ($ar, $comp, $which) = @_;
+    my $t = $which eq 'updated' ? $comp->time_updated : $comp->time_modified;
+    return $ar->display_date($t, TABLE_DATE) . '.' . int((int($t) % 60) / 6) if defined $t;
+    return $which eq 'updated' ? $comp->time_updated_string : $comp->time_modified_string;
 }
 
 # ---------------------------------------------------------------------------
@@ -783,12 +802,22 @@ sub do_table {
         }
         unless ($header_done) {
             print "\n", expand_tabs("\t$c->{disp}"), "\n\n";
-            print $k->{long}
-                ? expand_tabs(" name\t\t\t      updated      mode\tmodified\t   length") . "\n\n"
-                : expand_tabs("  updated\t\t   name") . "\n\n";
+            print !$k->{long} ? expand_tabs("  updated\t\t   name") . "\n\n"
+                : $opt{experimental}
+                ? " name                                updated       mode    modified       length\n\n"
+                : expand_tabs(" name\t\t\t      updated      mode\tmodified\t   length") . "\n\n";
             $header_done = 1;
         }
-        if ($k->{long}) {
+        if ($opt{experimental}) {
+            if ($k->{long}) {
+                printf "%-32s %-17s %-4s%-17s %7d\n", $comp->name, table_date($ar, $comp, 'updated'),
+                    $comp->mode_field, table_date($ar, $comp, 'modified'), $comp->bit_count;
+            }
+            else {
+                printf "%-20s%s\n", table_date($ar, $comp, 'updated'), $comp->name;
+            }
+        }
+        elsif ($k->{long}) {
             printf "%-32s%-17s%-5s%-16s%8d\n", $comp->name, $comp->time_updated_string,
                 $comp->mode_field, $comp->time_modified_string, $comp->bit_count;
         }
@@ -860,13 +889,16 @@ sub do_replace {
             return $fail->(\$e);
         }
         my $mtime = $st[9];
+        # u: what the dates say (Archive::Multics::date_compare); if they
+        # cannot tell, the contents decide, once read.
+        my $old = $k->{update} ? $ar->get_component($cname) : undef;
+        my $newer = $old ? $ar->date_compare($mtime, $old) : 1;
         if ($k->{update}) {
-            my $old = $ar->get_component($cname);
-            if ($old && !$ar->is_newer($mtime, $old)) {
+            if ($newer < 0) {
                 $r->{flag} = 3 if $r;    # code 0: latest copy already in archive
                 return 0;
             }
-            $updated_something = 1;
+            $updated_something = 1 if $newer > 0;
         }
         open my $fh, '<:raw', $src or return $fail->($!);
         my $contents = do { local $/; <$fh> } // '';
@@ -875,6 +907,13 @@ sub do_replace {
         print STDERR "$ME: Warning: $sdisp: $_.\n" for @{ $ar->{source_warnings} // [] };
         unless (@sd) { my $e = $ar->error; return $fail->(\$e) }
         my ($data, %extra) = @sd;
+        if ($k->{update} && $newer == 0) {
+            unless ($ar->is_newer($mtime, $old, $data, %extra)) {
+                $r->{flag} = 3 if $r;    # same contents: latest copy already in archive
+                return 0;
+            }
+            $updated_something = 1;
+        }
         # A component with 9-bit data is only replaced from data whose bit
         # count is known: a transfer file, or raw dense9 with --bits.
         if (!defined $extra{bit_count} && (my $old = $ar->get_component($cname))) {
@@ -1229,9 +1268,15 @@ Replace and delete, and the copy forms, as for append.
 
 =item B<u>
 
-As B<r>, but replace only components whose file has a later
-modification time than the component's "modified" date, compared to a
-tenth of a minute. Components are not added.
+As B<r>, but replace only components whose file is newer than the
+component. Components are not added. A file whose modification time is
+before the component's "modified" date is not newer, and one 6 seconds
+or more after it is. Header dates are truncated (to the second, or to
+the tenth of a minute), so in between the dates cannot tell: the file
+is not newer if the component was archived after those 6 seconds, and
+otherwise it is newer if its contents differ. This is what the
+experimental Multics archive for MCR10207 does; released Multics
+compares the dates to a tenth of a minute and nothing else.
 
 =item B<ud>, B<udf>, B<cu>, B<cud>, B<cudf>
 
@@ -1384,8 +1429,29 @@ size in words, and its form.
 
 =item B<-z> I<zone>, B<--zone> I<zone>
 
-Time zone for archive dates, which carry none. Default: the local zone.
-Use the zone of the Multics site that wrote the archive.
+Time zone for archive dates in the original form, which carry none, and
+for dates shown by B<t> and B<tl> with B<--experimental>. Default: the
+local zone. Use the zone of the Multics site that wrote the archive.
+Dates in the ISO form are in GMT.
+
+=item B<--exl>, B<--experimental>
+
+Act as the experimental Multics archive for MCR10207. A new archive (or
+one with no components) is written with dates in the form
+C<yyyymmddThhmmssZ>, in GMT and to the second, in the same 16-character
+header fields. B<t> and B<tl> show dates converted to the local zone as
+C<yyyy-mm-dd hhmm.m>, and B<tl> shows the full mode field directly before
+the modified date (its fourth character, the obsolete append flag, is
+normally blank) and the length right-justified in 7 columns, 80 columns in
+all.
+
+Without it, both date forms are still read, and an archive keeps the
+form of its first component's dates, so an archive made on a Multics
+running the experimental archive stays in that form when it is changed
+here. B<t> and B<tl> show dates as stored, as released Multics does.
+Released Multics (C<archive_>, and so C<::> pathnames, the compilers,
+C<print> and the library tools) reports a format error on such an
+archive; its B<archive> command lists one but shows the dates raw.
 
 =item B<-P> I<n>, B<--century-pivot> I<n>
 

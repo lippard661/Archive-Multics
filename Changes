@@ -1,5 +1,28 @@
 Revision history for Archive-Multics
 
+0.09  2026-11-16
+      - Experimental ISO header dates, as the experimental Multics
+        archive for MCR10207 writes them: "yyyymmddThhmmssZ", in GMT,
+        to the second, in the same 16-character fields, with both pads
+        blank. Both forms are always read, each date by its own form;
+        the time zone (-z, tz) applies only to the original form.
+      - A new header takes the date form of the archive's first
+        component, so an archive keeps its form. A new or empty archive
+        is original, unless --experimental (--exl) or date_form => 'iso'
+        is given. date_form (archive and component), format_date's form
+        argument and display_date are new.
+      - --experimental also shows t and tl as the experimental archive
+        does: dates converted to the local zone as yyyy-mm-dd hhmm.m,
+        the full mode field (directly before the modified date), the
+        length right-justified in 7 columns (80 columns). Without it,
+        dates are
+        shown as stored, as released Multics shows them.
+      - u, and update_component, follow the experimental archive: a
+        header date may be up to 6 seconds early, so a source dated in
+        those 6 seconds is not newer if the component was archived
+        after them, and otherwise is newer only if its contents differ.
+        date_compare is new; is_newer takes the source's data. Before,
+        a source in the same tenth of a minute was never newer.
 0.08  2026-11-06
       - Extracting onto a symbolic link reports it as Multics does
         from MR12.9 (MCR10177 bug 5): xf and xdf print "Name

@@ -19,6 +19,7 @@ t/13-dense9.t
 t/14-dupnames.t
 t/15-gzip.t
 t/16-sha256.t
+t/17-iso-dates.t
 t/data/README
 t/data/bound_secure_hash_.dense9
 t/data/tests.ac_t.txt

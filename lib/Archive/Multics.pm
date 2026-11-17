@@ -3,7 +3,7 @@ package Archive::Multics;
 use strict;
 use warnings;
 
-our $VERSION = '0.08';
+our $VERSION = '0.09';
 
 use Carp qw(croak);
 use Fcntl qw(:mode);
@@ -14,6 +14,7 @@ use Compress::Raw::Zlib ();
 use IO::Compress::Gzip ();
 use Digest::SHA ();
 use POSIX ();
+use Time::Local ();
 use Archive::Multics::Component;
 
 # ---------------------------------------------------------------------------
@@ -31,6 +32,10 @@ use constant TRANSFER_WIDTH => 64;                          # base64 line width 
 
 # Seconds between 1901-01-01 00:00 GMT (Multics clock epoch) and 1970-01-01.
 use constant MULTICS_EPOCH_OFFSET => 2_177_452_800;
+
+# Header dates are truncated, to the second (ISO form) or to the tenth of a
+# minute (original form): a date is at most this many seconds early.
+use constant DATE_PRECISION => 6;
 
 # Error codes, named after the error_table_ entries archive_ returns, plus
 # a few for conditions that only arise on Unix.
@@ -65,6 +70,7 @@ sub new {
         pivot      => $opt{century_pivot} // 50, # RFC 5322; or 'window' (see _year)
         now        => $opt{now},                 # for tests: "current" Unix time
         validate   => $opt{validate} // 'full',  # 'full' or 'basic'
+        date_form  => $opt{date_form} // 'original', # dates of a new archive: 'original' or 'iso'
         salvage    => $opt{salvage},            # skip damage instead of failing
         force_enc  => $opt{encoding},           # 'byte8' or 'dense9': don't detect
         encoding   => $opt{encoding} // 'byte8', # how the archive is read/written
@@ -75,6 +81,8 @@ sub new {
     }, $class;
     croak "validate must be 'full' or 'basic'"
         unless $self->{validate} =~ /^(?:full|basic)$/;
+    croak "date_form must be 'original' or 'iso'"
+        unless $self->{date_form} =~ /^(?:original|iso)$/;
     croak "century_pivot must be a number from 0 to 100 or 'window'"
         unless $self->{pivot} =~ /^(?:window|\d+)$/ && ($self->{pivot} eq 'window' || $self->{pivot} <= 100);
     croak "encoding must be 'byte8' or 'dense9'"
@@ -659,7 +667,7 @@ sub _header_at {
     (my $bct = $h{bcf}) =~ s/^ +| +$//g;
     return 'Bit count field "' . _printable($h{bcf}) . '" is not a number.' unless $bct =~ /^[0-9]+$/;
     return 'Date field contains invalid characters.'
-        if $h{timeup} =~ m{[^0-9 ./]} || $h{time} =~ m{[^0-9 ./]};
+        if $h{timeup} =~ m{[^0-9 ./TZ]} || $h{time} =~ m{[^0-9 ./TZ]};
     return 'Mode field contains invalid characters.' if $h{mode} =~ /[^rewa ]/;
     ($h{cname} = $h{name}) =~ s/ +$//;
     $h{bc} = $bct + 0;
@@ -824,9 +832,27 @@ sub warnings { @{ $_[0]{warnings} // [] } }
 sub trailer { $_[0]{trailer} // '' }
 
 # ---------------------------------------------------------------------------
-# Dates. Header dates are the first 16 characters of date_time_ output,
-# "mm/dd/yy  hhmm.m", in the writer's local time zone with no zone recorded.
-# They are interpreted here in $self->{tz} (default: the local zone).
+# Dates. A header date has one of two forms:
+#
+#   original  the first 16 characters of date_time_ output, "mm/dd/yy  hhmm.m",
+#             in the writer's local time zone with no zone recorded; read
+#             here in $self->{tz} (default: the local zone).
+#   iso       "yyyymmddThhmmssZ", in GMT (the experimental Multics archive
+#             for MCR10207); the time zone does not apply.
+#
+# Each date field is recognized by its own form. New headers take the form
+# of the archive's first component, so that an archive keeps one form; an
+# archive with no components gets $self->{date_form}.
+
+sub _is_iso_date { defined $_[0] && $_[0] =~ /^\d{8}T\d{6}Z$/ }
+
+# The form new headers in this archive get.
+sub date_form {
+    my $self = shift;
+    my $first = $self->{components}[0];
+    return $self->{date_form} unless $first;
+    return _is_iso_date($first->{timeup}) ? 'iso' : 'original';
+}
 
 sub _with_tz {
     my ($self, $code) = @_;
@@ -865,6 +891,12 @@ sub _year {
 
 sub _parse_date {
     my ($self, $s) = @_;
+    if (_is_iso_date($s)) {
+        my ($y, $mo, $d, $h, $mi, $sec) = $s =~ /^(\d{4})(\d\d)(\d\d)T(\d\d)(\d\d)(\d\d)Z$/;
+        return if $y < 1901 || $mo < 1 || $mo > 12 || $d < 1 || $d > 31 || $h > 23 || $mi > 59 || $sec > 59;
+        my $e = eval { Time::Local::timegm($sec, $mi, $h, $d, $mo - 1, $y) };
+        return $e;            # timegm refuses dates like 02/31
+    }
     my ($mo, $d, $y, $h, $mi, $t) =
         $s =~ m{^(\d\d)/(\d\d)/(\d\d)  (\d\d)(\d\d)\.(\d)$} or return;
     return if $mo < 1 || $mo > 12 || $d < 1 || $d > 31 || $h > 23 || $mi > 59;
@@ -879,9 +911,14 @@ sub _parse_date {
     });
 }
 
-# Tenths of a minute are truncated, as date_time_ does (to be confirmed).
+# Tenths of a minute, or seconds, are truncated, as date_time_ does.
 sub _format_date {
-    my ($self, $epoch) = @_;
+    my ($self, $epoch, $form) = @_;
+    if (($form // 'original') eq 'iso') {
+        my @gt = gmtime int $epoch;
+        return sprintf '%04d%02d%02dT%02d%02d%02dZ',
+            $gt[5] + 1900, $gt[4] + 1, $gt[3], $gt[2], $gt[1], $gt[0];
+    }
     return $self->_with_tz(sub {
         my @lt = localtime $epoch;
         sprintf '%02d/%02d/%02d  %02d%02d.%d',
@@ -975,6 +1012,7 @@ sub _make_component {
     my ($self, $name, $data, %a) = @_;
     $self->_check_new_name($name) or return;
     my $now = $a{time_updated} // time;
+    my $form = $self->date_form;
     my $bc  = $a{bit_count} // 9 * length($data);
     return $self->_fail(bad_data => "Bit count \"$bc\" is not a number from 0 to " . MAX_BITS . '.')
         unless $bc =~ /^[0-9]+$/ && $bc <= MAX_BITS;
@@ -989,8 +1027,8 @@ sub _make_component {
         data      => substr($data, 0, int($bc / 9)),
         lossless  => 1,
         mode      => _normalize_mode($a{access}),
-        timeup    => $self->_format_date($now),
-        time      => $self->_format_date($a{time_modified} // $now),
+        timeup    => $self->_format_date($now, $form),
+        time      => $self->_format_date($a{time_modified} // $now, $form),
     );
 }
 
@@ -1016,29 +1054,54 @@ sub append_component {
     return $self->replace_component($name, $data, %a);
 }
 
-# Replace only if the new modification time is later than the component's,
-# compared at the header's tenth-of-a-minute resolution (key "u").
-# Returns the new component, 0 if the archive copy is current, or undef on
-# error (no_component if the name is not in the archive).
+# Replace only if the source is newer than the component (key "u"; see
+# is_newer). Returns the new component, 0 if the archive copy is current, or
+# undef on error (no_component if the name is not in the archive).
 sub update_component {
     my ($self, $name, $data, %a) = @_;
     my $old = $self->get_component($name) or return;
-    unless ($self->is_newer($a{time_modified} // time, $old)) { $self->_ok; return 0 }
+    unless ($self->is_newer($a{time_modified} // time, $old, $data, %a)) { $self->_ok; return 0 }
     return $self->replace_component($name, $data, %a);
 }
 
-# True if Unix time $t is later than the component's "modified" date, compared
-# at the header's tenth-of-a-minute resolution, as archive 'u' does. An
-# unparseable component date counts as the beginning of time.
-sub is_newer {
+# What the dates say about a source modified at Unix time $t, against the
+# component, as the experimental Multics archive's u does: 1 newer, -1 not
+# newer, 0 cannot tell. A header date is truncated, so a source dated less
+# than DATE_PRECISION seconds after the component's "modified" date may be
+# the one archived; it cannot be newer if the component was archived after
+# that interval. A component date that cannot be read makes the source newer.
+sub date_compare {
     my ($self, $t, $comp) = @_;
-    my $new_t = $self->_parse_date($self->_format_date($t)) // 0;
-    my $old_t = $comp->time_modified // 0;
-    return $new_t > $old_t;
+    my $mod = $comp->time_modified;
+    return 1 unless defined $mod;
+    return -1 if $t < $mod;
+    return 1 if $t >= $mod + DATE_PRECISION;
+    my $upd = $comp->time_updated;
+    return -1 if defined $upd && $upd >= $mod + DATE_PRECISION;
+    return 0;
 }
 
-# Display form of a date, as written in headers.
-sub format_date { my ($self, $t) = @_; return $self->_format_date($t) }
+# True if a source modified at Unix time $t is newer than the component. If
+# the dates cannot tell, the source is newer unless its data ($data, with
+# bit_count => N for 9-bit data) is the component's; without $data, it is.
+sub is_newer {
+    my ($self, $t, $comp, $data, %a) = @_;
+    my $c = $self->date_compare($t, $comp);
+    return $c > 0 if $c;
+    return 1 unless defined $data;
+    my $bc = $a{bit_count} // 9 * CORE::length($data);
+    return 1 if $bc != $comp->bit_count;
+    return $data ne ($comp->{cdata} // $comp->{data}) ? 1 : 0;
+}
+
+# Header form of a date: $form 'original' (default) or 'iso'.
+sub format_date { my ($self, $t, $form) = @_; return $self->_format_date($t, $form) }
+
+# A Unix time for display, with strftime($fmt), in the archive's zone.
+sub display_date {
+    my ($self, $t, $fmt) = @_;
+    return $self->_with_tz(sub { POSIX::strftime($fmt, localtime int $t) });
+}
 
 # Remove a specific component object (e.g. one of several with a name).
 sub remove_component {
@@ -1219,8 +1282,9 @@ archive read from a gzip file is written back as one.
 
 =item tz
 
-Time zone in which header dates are interpreted and written (they carry
-no zone). Default: the local zone.
+Time zone in which original-form header dates are interpreted and
+written (they carry no zone), and in which C<display_date> shows times.
+Default: the local zone. ISO-form dates are in GMT and need no zone.
 
 =item century_pivot
 
@@ -1234,6 +1298,15 @@ C<window> takes a two-digit year as the latest year ending in those
 digits that is at most one year after the current year. It agrees with
 50 for every date that can occur before 2050 and keeps working after
 that, but its results depend on the current date.
+
+=item date_form
+
+The form of the dates written in an archive with no components:
+C<original> (default), C<mm/dd/yy  hhmm.m> in local time, as every
+released Multics writes; or C<iso>, C<yyyymmddThhmmssZ> in GMT, as the
+experimental Multics archive for MCR10207 writes. An archive that has
+components keeps the form of its first component's dates, whatever this
+says, so that its form never changes. Both forms are always read.
 
 =item validate
 
@@ -1355,20 +1428,42 @@ Add the component unless one with that name exists (key C<a>).
 
 =head2 update_component($name, $data, %attr)
 
-Replace the component only if C<time_modified> is later (key C<u>).
+Replace the component only if the source is newer (key C<u>; see
+C<is_newer>).
 
 C<%attr>: C<time_modified> (Unix time), C<time_updated> (default now),
 C<access> (C<"rew">, C<"rw">, C<"null"> ...; default C<"rw">).
 C<update_component> returns 0 when the archive copy is current.
 
-=head2 is_newer($unix_time, $component)
+=head2 date_compare($unix_time, $component)
 
-True if the time is later than the component's "modified" date at the
-header's tenth-of-a-minute resolution (the C<u> key's test).
+What the dates say about a source modified at that time: 1 newer, -1
+not newer, 0 cannot tell. Header dates are truncated, to the second or
+the tenth of a minute, so a source dated less than 6 seconds after the
+component's "modified" date may be the one archived; if the component
+was archived after those 6 seconds, it is not newer. A component date
+that cannot be read makes the source newer. This is the test the
+experimental Multics archive's C<u> makes.
 
-=head2 format_date($unix_time)
+=head2 is_newer($unix_time, $component, [$data, bit_count => $n])
 
-The 16-character header form, C<mm/dd/yy  hhmm.m>, in the archive's zone.
+True if the source is newer: by C<date_compare>, or, when the dates
+cannot tell, if its data differs from the component's. Without C<$data>,
+a source the dates cannot decide is taken to be newer.
+
+=head2 date_form
+
+The form new headers in the archive get: C<iso> or C<original>
+(see C<date_form> under C<new>).
+
+=head2 format_date($unix_time, [$form])
+
+The 16-character header form: C<mm/dd/yy  hhmm.m> in the archive's zone,
+or with C<$form> C<iso>, C<yyyymmddThhmmssZ> in GMT.
+
+=head2 display_date($unix_time, $strftime_format)
+
+The time formatted with L<POSIX/strftime> in the archive's zone.
 
 =head2 delete_component($name)
 
@@ -1436,8 +1531,9 @@ C<is_text> (octets lose nothing), C<has_ninth_bits>, C<lossless>
 C<dense9> (the component's bits, packed), C<transfer_string> (as a
 dense9 transfer file), C<access>, C<readable>, C<executable>,
 C<writable>, C<mode_field>, C<time_updated>, C<time_modified>
-(Unix times), C<time_updated_string>, C<time_modified_string>
-(raw header text), C<multics_time_updated>, C<multics_time_modified>
+(Unix times; undef if the date cannot be read), C<time_updated_string>,
+C<time_modified_string> (raw header text), C<date_form> (C<iso> or
+C<original>, from the "updated" date), C<multics_time_updated>, C<multics_time_modified>
 (Multics clock readings), C<header>.
 
 =head1 OPENBSD PLEDGE AND UNVEIL

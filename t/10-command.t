@@ -141,10 +141,11 @@ utime 1790000000, 1790000000, "$d/one", "$d/two";
     ($o, $e) = run($d, undef, 'u', 'x', 'one', 'two', 'four');
     like $e, qr/Did not update two because latest copy already in/, 'u: older named source';
     like $e, qr/four not found in/, 'u: does not add';
-    # Within the same tenth of a minute is not newer.
+    # Within the 6 seconds a header date may be early, of a component
+    # archived after them: not newer.
     utime 1790001203, 1790001203, "$d/one";
     ($o, $e) = run($d, undef, 'u', 'x', 'one');
-    like $e, qr/contains the latest versions/, 'u: 0.1-minute resolution';
+    like $e, qr/contains the latest versions/, 'u: within the date precision, archived later';
 }
 
 # ---------------------------------------------------------------------------

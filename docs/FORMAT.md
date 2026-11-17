@@ -45,7 +45,7 @@ An archive is a sequence of zero or more entries, each:
 | 0      | 8   | `header_begin` | `ident` | must equal `ident` |
 | 8      | 4   | `pad1`         | 4 blanks | none |
 | 12     | 32  | `name`         | component name, blank-padded | none |
-| 44     | 16  | `timeup`       | first 16 chars of `date_time_ (clock_ ())` when archived | chars in `0123456789 ./`; parsed by `convert_date_to_binary_` (info entries only) |
+| 44     | 16  | `timeup`       | first 16 chars of `date_time_ (clock_ ())` when archived; or `yyyymmddThhmmssZ` (experimental, see below) | chars in `0123456789 ./`; parsed by `convert_date_to_binary_` (info entries only) |
 | 60     | 4   | `mode`         | positional: `r`/` `, `e`/` `, `w`/` `, ` `/`a` | chars in `rewa `; positions checked by info entries only |
 | 64     | 16  | `time`         | first 16 chars of `date_time_$fstime` of the source's dtcm | as `timeup` |
 | 80     | 4   | `pad`          | 4 blanks | none |
@@ -82,6 +82,29 @@ Notes:
   tenths of a minute truncated (seconds / 6, rounded down); whether
   Multics `date_time_` truncates or rounds has not been checked, and would
   only affect the last digit.
+- Experimental ISO dates (MCR10207 draft, not in any release): the
+  experimental `archive_` and `archive` write both dates as
+  `yyyymmddThhmmssZ`, in GMT, truncated to the second, in the same
+  16-character fields; both pads stay blank, and nothing else in the
+  header changes. Each date field is recognized by its own form, so an
+  archive may mix the two. A new header takes the form of the archive's
+  first component (`archive_$set_header_times` is given that header as a
+  model), so an existing archive keeps its form and only a new or empty
+  one gets ISO dates. Original-form dates are read in the reader's zone,
+  as before, with the year taken to lie in 1971-2070. Released
+  `archive_` rejects `T` and `Z` with `archive_fmt_err`, so `::`
+  pathnames, the compilers, `print` and the library tools cannot use an
+  ISO archive; the released `archive` command (`archive_util_`) lists it
+  with the dates raw, and its `u` cannot parse them and so replaces
+  every component it is given. `Archive::Multics` reads both forms, and
+  writes ISO dates for a new archive with `date_form => 'iso'`
+  (`archive --experimental`).
+- The experimental `u`: a header date is truncated (to the second, or
+  to the tenth of a minute), so it may be up to 6 seconds early. A source
+  dated before the component's "modified" date is not newer; 6 seconds
+  or more after, it is. In between it is not newer if the component was
+  archived ("updated") 6 seconds or more after its "modified" date, and
+  otherwise it is newer if its bit count or contents differ.
 - Validation is split: the pointer entries (`get_component`,
   `next_component`) check only character sets; the info entries
   (`*_info`, `list_components`) also check mode positions and parse
