@@ -3,7 +3,7 @@ package Archive::Multics;
 use strict;
 use warnings;
 
-our $VERSION = '0.09';
+our $VERSION = '0.10';
 
 use Carp qw(croak);
 use Fcntl qw(:mode);
@@ -53,6 +53,7 @@ our %MESSAGES = (
     bad_gzip              => 'Not a valid gzip file.',
     bad_data              => 'Component data is not 9-bit characters.',
     bad_date              => 'Invalid date.',
+    date_range            => 'Date cannot be written in the original form.',
     io                    => 'I/O error.',
 );
 
@@ -67,7 +68,7 @@ sub new {
     my $self = bless {
         components => [],
         tz         => $opt{tz},                  # undef: local TZ
-        pivot      => $opt{century_pivot} // 50, # RFC 5322; or 'window' (see _year)
+        pivot      => $opt{century_pivot} // 71, # MCR10207 (1971-2070); or 'window' (see _year)
         now        => $opt{now},                 # for tests: "current" Unix time
         validate   => $opt{validate} // 'full',  # 'full' or 'basic'
         date_form  => $opt{date_form} // 'original', # dates of a new archive: 'original' or 'iso'
@@ -871,11 +872,12 @@ sub _with_tz {
 
 # Four-digit year for a two-digit header year.
 #
-# century_pivot => N: fixed cutoff, yy >= N is 19yy. The default, 50, is
-# the rule of RFC 5322 section 4.3 (00-49 = 20yy, 50-99 = 19yy), proposed
-# for Multics as the fix for its year-2030 problem. 30 reproduces
-# convert_date_to_binary_ on MR12.8 (CONVERT_TO_4_DIGIT_YEAR), which fails
-# from 2030.
+# century_pivot => N: fixed cutoff, yy >= N is 19yy. The default, 71, is
+# the rule of MCR10207 (MR12.10): years 1971-2070, which covers every
+# archive date in the Multics libraries (the oldest is 12/23/71). 50 is
+# the rule of RFC 5322 section 4.3 (00-49 = 20yy, 50-99 = 19yy), the
+# default before 0.10. 30 reproduces convert_date_to_binary_ on MR12.8
+# (CONVERT_TO_4_DIGIT_YEAR), which fails from 2030.
 #
 # century_pivot => 'window': the latest year ending in yy that is no more than one
 # year after the current year. Header dates record past events, so this
@@ -924,6 +926,50 @@ sub _format_date {
         sprintf '%02d/%02d/%02d  %02d%02d.%d',
             $lt[4] + 1, $lt[3], $lt[5] % 100, $lt[2], $lt[1], int($lt[0] / 6);
     });
+}
+
+# Rewrites the two dates of every component in $form, 'iso' or 'original',
+# as convert_archive does on Multics for a single zone: original-form dates
+# are read, or written, in the archive's zone (tz). Dates already in $form
+# are left alone, and only the date fields of a header change. Converting
+# to 'original' truncates to the tenth of a minute, and refuses a date
+# whose year the century pivot would not read back (outside 1971-2070 by
+# default). On failure nothing is changed. Returns the number of
+# components changed, or undef.
+sub convert_dates {
+    my ($self, $form) = @_;
+    croak "form must be 'original' or 'iso'" unless defined $form && $form =~ /^(?:original|iso)$/;
+    my @new;
+    for my $c (@{ $self->{components} }) {
+        my @f;
+        for my $field (qw(timeup time)) {
+            my $s = $c->{$field};
+            if (($form eq 'iso') == (_is_iso_date($s) ? 1 : 0)) { push @f, $s; next }
+            my $t = $self->_parse_date($s);
+            return $self->_fail(bad_date => "\"$s\" (" . $c->name . ')') unless defined $t;
+            my $out = $self->_format_date($t, $form);
+            if ($form eq 'original') {
+                my $year = $self->_with_tz(sub { (localtime $t)[5] + 1900 });
+                return $self->_fail(date_range => "$year (" . $c->name . ')')
+                    unless $self->_year(substr $out, 6, 2) == $year;
+            }
+            push @f, $out;
+        }
+        push @new, [ $c, @f ];
+    }
+    my $n = 0;
+    for (@new) {
+        my ($c, $up, $mod) = @$_;
+        next if $up eq $c->{timeup} && $mod eq $c->{time};
+        @$c{qw(timeup time)} = ($up, $mod);
+        if (defined $c->{raw}) {    # keep the rest of the header as read
+            substr($c->{raw}, 44, 16) = $up;
+            substr($c->{raw}, 64, 16) = $mod;
+        }
+        $n++;
+    }
+    $self->_ok;
+    return $n;
 }
 
 sub unix_to_multics_clock { my $t = shift; return int(($t + MULTICS_EPOCH_OFFSET) * 1_000_000) }
@@ -1289,10 +1335,12 @@ Default: the local zone. ISO-form dates are in GMT and need no zone.
 =item century_pivot
 
 How two-digit header years get their century. A number is a fixed
-cutoff: years at or above it are 19yy, below it 20yy. The default is 50,
-the rule of RFC 5322 section 4.3, which reads every archive date from
-1950 to 2049 correctly. 30 reproduces C<convert_date_to_binary_> on
-Multics MR12.8, which misreads dates from 2030 on.
+cutoff: years at or above it are 19yy, below it 20yy. The default is 71,
+the rule of MCR10207 (Multics MR12.10), which reads every date from 1971
+to 2070; no archive date in the Multics libraries is older than 1971.
+50 is the rule of RFC 5322 section 4.3 (the default before 0.10). 30
+reproduces C<convert_date_to_binary_> on Multics MR12.8, which misreads
+dates from 2030 on.
 
 C<window> takes a two-digit year as the latest year ending in those
 digits that is at most one year after the current year. It agrees with
@@ -1464,6 +1512,19 @@ or with C<$form> C<iso>, C<yyyymmddThhmmssZ> in GMT.
 =head2 display_date($unix_time, $strftime_format)
 
 The time formatted with L<POSIX/strftime> in the archive's zone.
+
+=head2 convert_dates($form)
+
+Rewrite both dates of every component in C<$form>, C<iso> or
+C<original>, as C<convert_archive> does on Multics for a single zone.
+Original-form dates are read, or written, in the archive's zone (C<tz>).
+Dates already in C<$form> are left alone, and nothing else in a header
+changes. Converting to C<original> truncates to the tenth of a minute,
+and fails with C<date_range> for a date whose year the century pivot
+would not read back (outside 1971-2070 by default); a date that cannot
+be read fails with C<bad_date>. On failure nothing is changed. Returns
+the number of components changed (0 if all were already in C<$form>),
+or undef. Call C<write> to save the result.
 
 =head2 delete_component($name)
 

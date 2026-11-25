@@ -65,9 +65,10 @@ From Perl:
 - Header dates carry no time zone. They are read and written in the local
   zone unless another is given (`-z`, `tz`); use the zone of the Multics
   site that wrote the archive.
-- Two-digit years: 00-49 are 20yy and 50-99 are 19yy (RFC 5322). Multics
-  MR12.8 uses 30 as the cutoff, and so misreads dates from 2030 on;
-  `-P 30` reproduces it.
+- Two-digit years are 1971-2070 (71-99 are 19yy, 00-70 20yy), the rule
+  of MCR10207 for Multics MR12.10. Multics MR12.8 uses 30 as the cutoff,
+  and so misreads dates from 2030 on; `-P 30` reproduces it, and `-P 50`
+  the RFC 5322 rule that was the default before 0.10.
 - Two transfer forms are read, and detected automatically. In text mode
   (byte8) each 9-bit Multics character becomes one byte and its 9th bit
   is lost: source archives lose nothing, but binary components such as

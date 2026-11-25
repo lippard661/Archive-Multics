@@ -19,7 +19,7 @@ use Fcntl qw(:flock :mode);
 use File::Basename qw(fileparse);
 use Getopt::Long qw(:config bundling require_order no_ignore_case);
 
-our $VERSION = '0.09';
+our $VERSION = '0.10';
 my $ME = 'archive';
 
 # ---------------------------------------------------------------------------
@@ -83,6 +83,7 @@ GetOptions(
     'gzip'              => \$opt{gzip},
     'P|century-pivot=s' => \$opt{pivot},
     'exl|experimental'  => \$opt{experimental},
+    'convert=s'         => \$opt{convert},
     'h|help'            => \$opt{help},
     'V|version'         => \$opt{version},
 ) or usage_exit(2);
@@ -92,6 +93,7 @@ if ($opt{help}) {
 Usage: $ME [options] key archive_path {paths}
        $ME --import transfer_file archive_path
        $ME [--gzip] --export archive_path transfer_file
+       $ME --exl --convert utc|original [-z TZ] archive_path
 
 Keys:  t tl tb tlb          table of contents
        a ad adf ca cad cadf append
@@ -102,12 +104,15 @@ Keys:  t tl tb tlb          table of contents
 
 Options:
   -z, --zone TZ           time zone for archive dates (default: local)
-  -P, --century-pivot N   2-digit years >= N are 19yy (default 50, RFC 5322;
+  -P, --century-pivot N   2-digit years >= N are 19yy (default 71, MCR10207;
                           30 is Multics MR12.8; "window" for a rolling window)
       --exl, --experimental
                           act as the experimental Multics archive (MCR10207):
                           a new archive gets yyyymmddThhmmssZ (GMT) dates, and
                           t and tl show dates as yyyy-mm-dd hhmm.m
+      --convert FORM      with --exl: convert every date in the archive to
+                          FORM, utc or original (original-form dates in the
+                          -z zone), as convert_archive does on Multics
   -S, --salvage           read damaged archives as far as possible, with warnings
   -9, --dense9            write the archive in dense9 (9-bit) form
   -8, --byte8             write the archive in byte8 (one octet per character)
@@ -298,6 +303,7 @@ sub table_date {
 
 sub main {
     return convert() if $opt{import} || $opt{export};
+    return convert_dates() if defined $opt{convert};
     my $keyarg = shift @ARGV // usage_exit();
     if (length $keyarg > 4 || !$KEYS{$keyarg}) {
         com_err(0, "Unrecognized key - $keyarg");
@@ -703,6 +709,7 @@ sub process {
     if    ($k->{action} eq 'table')   { do_table(\%ctx) }
     elsif ($k->{action} eq 'replace') { do_replace(\%ctx) }
     elsif ($k->{action} eq 'delete')  { do_delete(\%ctx) }
+    elsif ($k->{action} eq 'convert') { do_convert(\%ctx) }
     else                              { do_extract(\%ctx) }
 
     # -B reports the archive as written (or read, for t and x); not after a
@@ -1043,6 +1050,61 @@ sub do_delete {
 }
 
 # ---------------------------------------------------------------------------
+# --convert (MCR10207): every date in the archive to one form
+
+sub convert_dates {
+    my %form = (utc => 'iso', iso => 'iso', original => 'original');
+    my $form = $form{ lc $opt{convert} };
+    unless ($form) {
+        print STDERR "$ME: --convert must be utc or original\n";
+        exit 2;
+    }
+    unless ($opt{experimental}) {
+        print STDERR "$ME: --convert is for the experimental (MCR10207) dates; give --exl too\n";
+        exit 2;
+    }
+    unless (@ARGV == 1) {
+        print STDERR "$ME: Usage:  $ME --exl --convert utc|original archive_path\n";
+        $status = 1;
+        return;
+    }
+    my ($dir, $name) = split_path($ARGV[0]);
+    $name = archive_name($dir, $name);
+    if (has_stars($name)) {
+        com_err(0, "Star convention cannot be used with --convert.  " . display_path($dir, $name));
+        return;
+    }
+    my $k = { key => '--convert', action => 'convert', zarg => 1, empty => 1, form => $form };
+    sandbox($k, $dir, [], $name) if $^O eq 'openbsd';
+    process($k, $dir, $name);
+}
+
+sub do_convert {
+    my ($c) = @_;
+    my ($ar, $form) = ($c->{ar}, $c->{k}{form});
+    my $what = $form eq 'iso' ? 'UTC' : 'the original form';
+    unless ($ar->list_components) {
+        info("$ME: $c->{disp} is empty; nothing to convert.");
+        $c->{unwritten} = 1;
+        return;
+    }
+    my $n = $ar->convert_dates($form);
+    unless (defined $n) {
+        com_err(\'', $ar->error);
+        com_err(0, "Archive $c->{disp} not converted.");
+        $c->{unwritten} = 1;
+        return;
+    }
+    unless ($n) {
+        info("$ME: $c->{disp}: all components are already in $what.");
+        $c->{unwritten} = 1;
+        return;
+    }
+    write_archive($c) or return;
+    info("$ME: $c->{disp}: $n component" . ($n == 1 ? '' : 's') . " converted to $what.");
+}
+
+# ---------------------------------------------------------------------------
 # x, xd, xdf, xf
 
 sub do_extract {
@@ -1137,6 +1199,8 @@ B<archive> [B<-S>] [B<-9> | B<-8>] [B<-T>] [B<--bits> I<n>] [B<-B>] [B<-z> I<zon
 B<archive> [B<-B>] B<--import> I<transfer_file> I<archive_path>
 
 B<archive> [B<-B>] [B<--gzip>] B<--export> I<archive_path> I<transfer_file>
+
+B<archive> B<--exl> B<--convert> B<utc>|B<original> [B<-z> I<zone>] [B<-P> I<pivot>] [B<-B>] I<archive_path>
 
 B<archive> B<-h> | B<-V>
 
@@ -1453,11 +1517,32 @@ Released Multics (C<archive_>, and so C<::> pathnames, the compilers,
 C<print> and the library tools) reports a format error on such an
 archive; its B<archive> command lists one but shows the dates raw.
 
+=item B<--convert> B<utc>|B<original>
+
+With B<--exl>, and instead of a key: convert both dates of every
+component of I<archive_path> to the UTC form (B<utc>) or back to the
+original form (B<original>), as C<convert_archive> does on Multics for a
+single zone. Original-form dates are read, or written, in the B<-z> zone
+(default: the local zone), which should be the zone of the Multics site
+that wrote the archive or will read it. Dates already in that form are
+left alone, and nothing else in a header changes, so an archive can be
+converted to UTC and back. Converting to the original form truncates to
+the tenth of a minute, and refuses (changing nothing) a date whose year
+two digits cannot hold (outside 1971-2070 with the default B<-P>). The
+star convention cannot be used. Archives whose components were written
+in different zones are converted on Multics, with C<convert_archive
+-table>.
+
+Use B<original> for an archive going to a Multics before MR12.10, whose
+C<archive_> cannot read UTC dates.
+
 =item B<-P> I<n>, B<--century-pivot> I<n>
 
 Two-digit years I<n> and above are 19yy, lower ones 20yy. The default,
-50, is the rule of RFC 5322 and reads every date from 1950 to 2049
-correctly. Multics MR12.8 uses 30, which misreads dates from 2030 on.
+71, is the rule of MCR10207 (Multics MR12.10) and reads every date from
+1971 to 2070; nothing in the Multics libraries is older than 1971. 50
+is the rule of RFC 5322 (the default before 0.10). Multics MR12.8 uses
+30, which misreads dates from 2030 on.
 B<window> instead takes the latest year ending in those digits that is
 at most one year from now.
 

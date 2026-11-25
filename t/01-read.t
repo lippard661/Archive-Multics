@@ -67,8 +67,13 @@ for (["01/01/25  0000.0", 3913167600000000], ["01/01/49  0000.0", 15147900000000
     is Archive::Multics::unix_to_multics_clock($p->_parse_date($_->[0])), $_->[1], "$_->[0] as Multics reads it";
 }
 
-# Default: RFC 5322 section 4.3 (00-49 = 20yy, 50-99 = 19yy).
-my $rfc = Archive::Multics->new(tz => 'UTC');
+# Default: MCR10207 (MR12.10), 1971-2070.
+my $mcr = Archive::Multics->new(tz => 'UTC');
+is $mcr->_year($_->[0]), $_->[1], "MCR10207: $_->[0] -> $_->[1]"
+    for [0, 2000], [29, 2029], [30, 2030], [50, 2050], [70, 2070], [71, 1971], [99, 1999];
+
+# RFC 5322 section 4.3 (00-49 = 20yy, 50-99 = 19yy), the default before 0.10.
+my $rfc = Archive::Multics->new(tz => 'UTC', century_pivot => 50);
 is $rfc->_year($_->[0]), $_->[1], "RFC 5322: $_->[0] -> $_->[1]"
     for [0, 2000], [29, 2029], [30, 2030], [49, 2049], [50, 1950], [69, 1969], [99, 1999];
 

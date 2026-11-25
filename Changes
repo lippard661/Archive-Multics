@@ -1,5 +1,19 @@
 Revision history for Archive-Multics
 
+0.10  2026-11-25
+      - archive --exl --convert utc|original converts every date in an
+        archive to the UTC form or back to the original form, as
+        convert_archive does on Multics (MCR10207) for one zone (-z).
+        Dates already in that form are left alone and nothing else in a
+        header changes; converting to the original form truncates to
+        the tenth of a minute and refuses years outside 1971-2070. The
+        library method is convert_dates. Archives are still never
+        converted by themselves: a header takes the form of the
+        archive's first component.
+      - The default century pivot is 71: two-digit years are 1971-2070,
+        as MCR10207 reads them on MR12.10. It was 50 (RFC 5322); -P 50
+        gives that.
+
 0.09  2026-11-16
       - Experimental ISO header dates, as the experimental Multics
         archive for MCR10207 writes them: "yyyymmddThhmmssZ", in GMT,

@@ -77,6 +77,58 @@ is $ar->format_date($upd), '11/16/26  1506.0', 'format_date original, local zone
 is $ar->display_date($upd, '%Y-%m-%d %H:%M'), '2026-11-16 15:06', 'display_date';
 
 # ---------------------------------------------------------------------------
+# convert_dates.
+
+{
+    my $a = Archive::Multics->new(tz => 'America/Phoenix', file => "$FindBin::Bin/data/tests.archive")
+        or die $Archive::Multics::error;
+    my $orig = $a->as_string;
+    my @names = $a->component_names;
+    my %t = map { $_->name => [ $_->time_updated, $_->time_modified ] } $a->list_components;
+    my $n = $a->convert_dates('iso');
+    is $n, scalar @names, 'convert_dates iso: every component converted';
+    is $a->date_form, 'iso', '... archive now ISO';
+    is_deeply { map { $_->name => [ $_->time_updated, $_->time_modified ] } $a->list_components }, \%t,
+        '... same times';
+    is length($a->as_string), length($orig), '... same length';
+    my $seed = $a->get_component('seed.txt');
+    like $seed->header, qr/^.{44}\d{8}T\d{6}Z.{4}\d{8}T\d{6}Z/s, '... header has ISO dates';
+    my $h1 = ($a->list_components)[0]->header;
+    is substr($h1, 0, 44) . substr($h1, 60, 4) . substr($h1, 80),
+        substr($orig, 0, 44) . substr($orig, 60, 4) . substr($orig, 80, 20), '... rest of first header unchanged';
+    is $a->convert_dates('iso'), 0, '... again: nothing to do';
+
+    my $b = Archive::Multics->new(tz => 'America/Phoenix');
+    $b->read_string($a->as_string) or die $Archive::Multics::error;
+    is $b->convert_dates('original'), scalar @names, 'convert_dates original';
+    is $b->as_string, $orig, '... round trip gives the original archive';
+
+    # Another zone: the same times, written differently.
+    my $tk = Archive::Multics->new(tz => 'Asia/Tokyo');
+    $tk->read_string($a->as_string) or die $Archive::Multics::error;
+    $tk->convert_dates('original');
+    is $tk->get_component('seed.txt')->time_updated, $t{'seed.txt'}[0], 'original in another zone: same time';
+    isnt $tk->get_component('seed.txt')->time_updated_string,
+        Archive::Multics->new(tz => 'America/Phoenix', file => "$FindBin::Bin/data/tests.archive")
+            ->get_component('seed.txt')->time_updated_string, '... different text';
+
+    # A year two digits cannot hold is refused, and nothing changes.
+    my $f = Archive::Multics->new(tz => 'UTC', date_form => 'iso');
+    $f->replace_component(ok => "ok\n", time_updated => $upd, time_modified => $mod);
+    my $y2071 = 3187296000;    # 2071-01-01 00:00 GMT
+    $f->replace_component(late => "l\n", time_updated => $y2071, time_modified => $mod);
+    my $before = $f->as_string;
+    ok !defined $f->convert_dates('original'), '2071 cannot be original';
+    is $f->error_code, 'date_range', '... date_range';
+    is $f->as_string, $before, '... nothing changed';
+    is $f->get_component('ok')->date_form, 'iso', '... not even the first component';
+    ok(Archive::Multics->new(tz => 'UTC', century_pivot => 72)->read_string($before) &&
+        1, '(a different pivot reads it)');
+    eval { $f->convert_dates('utc') };
+    like $@, qr/form must be/, 'bad form croaks';
+}
+
+# ---------------------------------------------------------------------------
 # The update test.
 
 {
@@ -127,6 +179,7 @@ sub run {
     return ($so, $se, $? >> 8);
 }
 sub spew { my ($f, $s) = @_; open my $fh, '>:raw', $f or die "$f: $!"; print $fh $s; close $fh }
+sub slurp { my ($f) = @_; open my $fh, '<:raw', $f or die "$f: $!"; local $/; my $s = <$fh>; close $fh; $s }
 
 my $d = abs_path(tempdir(CLEANUP => 1));
 my $t = time + 1000;    # a source date after the archiving
@@ -173,5 +226,30 @@ is(Archive::Multics->new(file => "$d/x.archive")->get_component('one')->data, "O
 copy("$FindBin::Bin/data/tests.archive", "$d/tests.archive") or die;
 ($so) = run($d, '--exl', 'tb', 'tests', 'seed.txt');
 is $so, "2026-09-22 1639.0   seed.txt\n\n", '--exl t: original date, read as local, shown converted';
+
+# --convert.
+my $rc;
+($so, $se, $rc) = run($d, '--convert', 'utc', 'tests');
+is $rc, 2, '--convert without --exl: usage error';
+like $se, qr/give --exl too/, '... message';
+($so, $se, $rc) = run($d, '--exl', '--convert', 'sideways', 'tests');
+like $se, qr/must be utc or original/, '--convert: bad form';
+($so, $se, $rc) = run($d, '--exl', '--convert', 'utc', 'tests');
+is $se, '', '--exl --convert utc: no errors';
+my $n_tests = scalar Archive::Multics->new(file => "$FindBin::Bin/data/tests.archive")->list_components;
+like $so, qr/: $n_tests components converted to UTC\.$/m, '... message';
+my $cv = Archive::Multics->new(file => "$d/tests.archive") or die $Archive::Multics::error;
+is $cv->date_form, 'iso', '... archive is ISO';
+($so) = run($d, '--exl', 'tb', 'tests', 'seed.txt');
+is $so, "2026-09-22 1639.0   seed.txt\n\n", '... same date shown';
+($so, $se) = run($d, '--exl', '--convert', 'utc', 'tests');
+like $so, qr/all components are already in UTC/, '... again: nothing to do';
+($so, $se) = run($d, '--exl', '--convert', 'original', 'tests.archive');
+is $se, '', '--convert original: no errors';
+is slurp("$d/tests.archive"), slurp("$FindBin::Bin/data/tests.archive"), '... round trip: the original file';
+($so, $se) = run($d, '--exl', '--convert', 'utc', '*.archive');
+like $se, qr/Star convention cannot be used with --convert/, '--convert: no star names';
+($so, $se) = run($d, '--exl', '--convert', 'utc', 'nonesuch');
+like $se, qr/nonesuch\.archive/, '--convert: missing archive reported';
 
 done_testing;

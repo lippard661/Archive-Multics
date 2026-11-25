@@ -76,13 +76,14 @@ Notes:
   50, 69, 70, 99). Confirmed from source: `convert_date_to_binary_`
   (`CONVERT_TO_4_DIGIT_YEAR`) uses a fixed cutoff, 00-29 = 2000-2029 and
   30-99 = 1930-1999, so from 2030 Multics misreads the dates it writes.
-  `Archive::Multics` defaults to cutoff 50 (RFC 5322 section 4.3), the
-  proposed Multics fix; `century_pivot => 30` reproduces MR12.8. Raw clock values from
+  `Archive::Multics` defaults to cutoff 71 (years 1971-2070), the rule
+  of MCR10207 (before 0.10, 50, as RFC 5322 section 4.3);
+  `century_pivot => 30` reproduces MR12.8. Raw clock values from
   `convert_date_to_binary_` match `unix_seconds` conversion exactly. `Archive::Multics` writes
-  tenths of a minute truncated (seconds / 6, rounded down); whether
-  Multics `date_time_` truncates or rounds has not been checked, and would
-  only affect the last digit.
-- Experimental ISO dates (MCR10207 draft, not in any release): the
+  tenths of a minute truncated (seconds / 6, rounded down), as Multics
+  does: `date_time_$format` with `^99v.9MH` truncates (checked on
+  MR12.9, 2026-11-24, with seconds 10, 23, 34 and 47).
+- Experimental ISO dates (MCR10207, for MR12.10; not in any release): the
   experimental `archive_` and `archive` write both dates as
   `yyyymmddThhmmssZ`, in GMT, truncated to the second, in the same
   16-character fields; both pads stay blank, and nothing else in the
@@ -98,7 +99,13 @@ Notes:
   with the dates raw, and its `u` cannot parse them and so replaces
   every component it is given. `Archive::Multics` reads both forms, and
   writes ISO dates for a new archive with `date_form => 'iso'`
-  (`archive --experimental`).
+  (`archive --experimental`). Neither the experimental `archive` nor
+  `Archive::Multics` converts an existing archive by itself:
+  `convert_archive` on Multics converts the dates of whole archives in
+  either direction, with a zone per archive or per component, and
+  `convert_dates` (`archive --exl --convert utc|original`) does the
+  same here for one archive in one zone. Only the two date fields
+  change.
 - The experimental `u`: a header date is truncated (to the second, or
   to the tenth of a minute), so it may be up to 6 seconds early. A source
   dated before the component's "modified" date is not newer; 6 seconds

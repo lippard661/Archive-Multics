@@ -149,7 +149,7 @@ Observations:
 | Concurrent use | Per-process `archive_data_$active` query | Exclusive `flock` on the archive while updating | Two processes can't interleave updates. |
 | Table layout | `ioa_` tabs, Multics tab stops every 10 columns | Tabs expanded to spaces at Multics 10-column stops, so output matches `ac t` / `ac tl` character for character on any terminal (test fixtures: `t/data/tests.ac_t*.txt`) | |
 | Bit count column in `tl` | Header field printed raw (left-justified counts run into the date, F52) | Printed right-justified, as Multics writes it | Identical for every archive Multics writes. |
-| Dates across 2030 (F53) | Two-digit years read with cutoff 30 (30-99 = 19yy), so `u` breaks across 2029/2030 | Cutoff 50, as RFC 5322 section 4.3 and the proposed Multics fix (`-P 30` for MR12.8 behavior, `-P window` for a rolling window) | Identical to Multics for every date before 2030; correct until 2050. |
+| Dates across 2030 (F53) | Two-digit years read with cutoff 30 (30-99 = 19yy), so `u` breaks across 2029/2030 | Cutoff 71 (1971-2070), as MCR10207 for MR12.10 (`-P 30` for MR12.8 behavior, `-P 50` for RFC 5322, `-P window` for a rolling window) | Identical to MR12.8 for every date from 1971 to 2029, and to MR12.10; correct until 2071. |
 | Star names in archive path | Expanded by the command | Shell expands unquoted globs; a quoted Multics star name is expanded by the command in Multics order; warning if a component argument names an existing `*.archive` file | |
 
 ## Perl implementation
