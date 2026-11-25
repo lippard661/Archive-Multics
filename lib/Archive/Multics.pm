@@ -843,7 +843,10 @@ sub trailer { $_[0]{trailer} // '' }
 #
 # Each date field is recognized by its own form. New headers take the form
 # of the archive's first component, so that an archive keeps one form; an
-# archive with no components gets $self->{date_form}.
+# archive with no components gets $self->{date_form}. A new header whose
+# dates the original form cannot hold (years outside the century pivot's
+# range, 1971-2070 by default) is written in the ISO form even in an
+# original-form archive, as on Multics from MR12.10.
 
 sub _is_iso_date { defined $_[0] && $_[0] =~ /^\d{8}T\d{6}Z$/ }
 
@@ -928,6 +931,15 @@ sub _format_date {
     });
 }
 
+# Whether a time can be written in the original form: whether the century
+# pivot reads its two-digit year back as the same year (1971-2070 by
+# default), in the archive's zone.
+sub _original_ok {
+    my ($self, $t) = @_;
+    my $year = $self->_with_tz(sub { (localtime $t)[5] + 1900 });
+    return $self->_year($year % 100) == $year;
+}
+
 # Rewrites the two dates of every component in $form, 'iso' or 'original',
 # as convert_archive does on Multics for a single zone: original-form dates
 # are read, or written, in the archive's zone (tz). Dates already in $form
@@ -948,10 +960,9 @@ sub convert_dates {
             my $t = $self->_parse_date($s);
             return $self->_fail(bad_date => "\"$s\" (" . $c->name . ')') unless defined $t;
             my $out = $self->_format_date($t, $form);
-            if ($form eq 'original') {
+            if ($form eq 'original' && !$self->_original_ok($t)) {
                 my $year = $self->_with_tz(sub { (localtime $t)[5] + 1900 });
-                return $self->_fail(date_range => "$year (" . $c->name . ')')
-                    unless $self->_year(substr $out, 6, 2) == $year;
+                return $self->_fail(date_range => "$year (" . $c->name . ')');
             }
             push @f, $out;
         }
@@ -1058,7 +1069,11 @@ sub _make_component {
     my ($self, $name, $data, %a) = @_;
     $self->_check_new_name($name) or return;
     my $now = $a{time_updated} // time;
+    my $mod = $a{time_modified} // $now;
     my $form = $self->date_form;
+    # A year the original form cannot hold is written in the ISO form,
+    # even in an original-form archive, rather than read back a century off.
+    $form = 'iso' if $form eq 'original' && !($self->_original_ok($now) && $self->_original_ok($mod));
     my $bc  = $a{bit_count} // 9 * length($data);
     return $self->_fail(bad_data => "Bit count \"$bc\" is not a number from 0 to " . MAX_BITS . '.')
         unless $bc =~ /^[0-9]+$/ && $bc <= MAX_BITS;
@@ -1074,7 +1089,7 @@ sub _make_component {
         lossless  => 1,
         mode      => _normalize_mode($a{access}),
         timeup    => $self->_format_date($now, $form),
-        time      => $self->_format_date($a{time_modified} // $now, $form),
+        time      => $self->_format_date($mod, $form),
     );
 }
 
@@ -1354,7 +1369,11 @@ C<original> (default), C<mm/dd/yy  hhmm.m> in local time, as every
 released Multics writes; or C<iso>, C<yyyymmddThhmmssZ> in GMT, as the
 experimental Multics archive for MCR10207 writes. An archive that has
 components keeps the form of its first component's dates, whatever this
-says, so that its form never changes. Both forms are always read.
+says, so that its form never changes. The exception is a date the
+original form cannot hold (a year outside 1971-2070 with the default
+C<century_pivot>): its header is written in the ISO form even in an
+original-form archive, which then holds both forms. Both forms are
+always read.
 
 =item validate
 
@@ -1502,7 +1521,8 @@ a source the dates cannot decide is taken to be newer.
 =head2 date_form
 
 The form new headers in the archive get: C<iso> or C<original>
-(see C<date_form> under C<new>).
+(see C<date_form> under C<new>), except that a header whose dates the
+original form cannot hold is always ISO.
 
 =head2 format_date($unix_time, [$form])
 

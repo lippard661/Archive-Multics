@@ -10,6 +10,11 @@ Revision history for Archive-Multics
         library method is convert_dates. Archives are still never
         converted by themselves: a header takes the form of the
         archive's first component.
+      - The exception: a new or replaced header whose dates the original
+        form cannot hold (a year outside 1971-2070) is written in the
+        ISO form even in an original-form archive, which then holds both
+        forms, rather than being read back a century off. MCR10207 makes
+        the Multics archive do the same.
       - The default century pivot is 71: two-digit years are 1971-2070,
         as MCR10207 reads them on MR12.10. It was 50 (RFC 5322); -P 50
         gives that.

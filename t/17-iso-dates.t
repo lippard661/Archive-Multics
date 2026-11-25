@@ -128,6 +128,28 @@ is $ar->display_date($upd, '%Y-%m-%d %H:%M'), '2026-11-16 15:06', 'display_date'
     like $@, qr/form must be/, 'bad form croaks';
 }
 
+# A new header in an original-form archive whose dates the original form
+# cannot hold is ISO, and the archive then holds both forms.
+{
+    my $o = Archive::Multics->new(tz => 'UTC', file => "$FindBin::Bin/data/tests.archive")
+        or die $Archive::Multics::error;
+    my $y2071 = 3187296000;    # 2071-01-01 00:00 GMT
+    $o->replace_component(future => "f\n", time_updated => $y2071, time_modified => $y2071);
+    my $fc = $o->get_component('future');
+    is $fc->time_updated_string, '20710101T000000Z', '2071 in an original archive: ISO header';
+    is $fc->time_updated, $y2071, '... read back as 2071';
+    is $o->date_form, 'original', '... the archive is still original';
+    $o->replace_component(now => "n\n", time_updated => $upd, time_modified => $mod);
+    is $o->get_component('now')->date_form, 'original', '... a 2026 header stays original';
+    $o->replace_component(old => "o\n", time_updated => $upd, time_modified => $y2071);
+    is $o->get_component('old')->time_modified_string, '20710101T000000Z',
+        '... either date out of range makes the header ISO';
+    my $p50 = Archive::Multics->new(tz => 'UTC', century_pivot => 50,
+        file => "$FindBin::Bin/data/tests.archive") or die $Archive::Multics::error;
+    $p50->replace_component(f50 => "f\n", time_updated => 2556144000, time_modified => 2556144000);  # 2051-01-01
+    is $p50->get_component('f50')->date_form, 'iso', '... the range follows the century pivot';
+}
+
 # ---------------------------------------------------------------------------
 # The update test.
 

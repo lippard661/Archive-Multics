@@ -1512,7 +1512,9 @@ all.
 Without it, both date forms are still read, and an archive keeps the
 form of its first component's dates, so an archive made on a Multics
 running the experimental archive stays in that form when it is changed
-here. B<t> and B<tl> show dates as stored, as released Multics does.
+here. (A component whose dates the original form cannot hold, years
+outside 1971-2070, gets ISO dates even in an original-form archive.)
+B<t> and B<tl> show dates as stored, as released Multics does.
 Released Multics (C<archive_>, and so C<::> pathnames, the compilers,
 C<print> and the library tools) reports a format error on such an
 archive; its B<archive> command lists one but shows the dates raw.

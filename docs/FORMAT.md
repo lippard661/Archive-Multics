@@ -91,7 +91,9 @@ Notes:
   archive may mix the two. A new header takes the form of the archive's
   first component (`archive_$set_header_times` is given that header as a
   model), so an existing archive keeps its form and only a new or empty
-  one gets ISO dates. Original-form dates are read in the reader's zone,
+  one gets ISO dates, except that a header whose dates the original form
+  cannot hold (years outside 1971-2070) is written in the ISO form even
+  in an original-form archive. Original-form dates are read in the reader's zone,
   as before, with the year taken to lie in 1971-2070. Released
   `archive_` rejects `T` and `Z` with `archive_fmt_err`, so `::`
   pathnames, the compilers, `print` and the library tools cannot use an
