@@ -10,7 +10,7 @@ segments survive the round trip.
 
 Archives read and written without changes come out byte for byte
 identical, and the command's keys, messages and table layout follow
-`archive` on Multics MR12.8, so `archive tl` on Unix prints what `ac tl`
+`archive` on Multics MR12.9, so `archive tl` on Unix prints what `ac tl`
 prints on Multics.
 
 ## OpenBSD installation
@@ -68,7 +68,10 @@ From Perl:
 - Two-digit years are 1971-2070 (71-99 are 19yy, 00-70 20yy), the rule
   of MCR10207 for Multics MR12.10. Multics MR12.8 uses 30 as the cutoff,
   and so misreads dates from 2030 on; `-P 30` reproduces it, and `-P 50`
-  the RFC 5322 rule that was the default before 0.10.
+  the RFC 5322 rule that was the default before 0.10. With --exl option,
+  uses four-digit years and UTC timestamps as proposed in MCR10207.
+- --convert [original|utc] option with --exl allows conversion of time
+  stamp format in both directions.
 - Two transfer forms are read, and detected automatically. In text mode
   (byte8) each 9-bit Multics character becomes one byte and its 9th bit
   is lost: source archives lose nothing, but binary components such as
