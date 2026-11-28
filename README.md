@@ -15,9 +15,9 @@ prints on Multics.
 
 ## OpenBSD installation
 
-The OpenBSD package is `p5-Archive-Multics-0.06.tgz`:
+The OpenBSD package is `p5-Archive-Multics-0.10.tgz`:
 
-    pkg_add ./p5-Archive-Multics-0.06.tgz
+    pkg_add ./p5-Archive-Multics-0.10.tgz
 
 It installs the module, `/usr/local/bin/archive`, and the manual pages
 archive(1) and Archive::Multics(3p). The package is architecture
